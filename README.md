@@ -14,5 +14,7 @@ To try it out:
 
 ```console
 $ git clone https://github.com/haampie/spack-installer-ui.git
-$ ./spack-installer-ui/spack-install.py
+$ cd spack-installer-ui
+$ ./spack-install.py
+$ ./spack-install.py -j4
 ```
