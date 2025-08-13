@@ -14,5 +14,5 @@ To try it out:
 
 ```console
 $ git clone https://github.com/haampie/spack-installer-ui.git
-$ ./spack-installer-ui/spack-installer.py
+$ ./spack-installer-ui/spack-install.py
 ```
