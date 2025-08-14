@@ -1,20 +1,22 @@
 Experiment with new Spack install interface for parallel builds.
 
-Note: this is just a dummy user interface, nothing gets built or installed.
+**Trying it out**
 
-Features:
+1. ```console
+   $ git clone https://github.com/haampie/spack-installer-ui.git
+   $ cd spack-installer-ui
+   $ ./spack-install.py
+   $ ./spack-install.py -j4
+   ```
+2. During the install demo you can change the output mode:
+   * Press <kbd>v</kbd> to toggle between overview and logs
+   * More specifically, press <kbd>1</kbd>, <kbd>2</kbd>, ..., to follow logs of a particular package (if multiple are being installed in parallel)
+
+**Note**: this is just a dummy user interface, nothing gets actually built or installed, it won't pollute your system or Spack instance.
+
+**Features**
 
 * basic GNU jobserver / client
 * implicit installs disappear from the screen after the build succeeds
-* explicit installs remain (in bold white)
-* you can press <kbd>v</kbd> to toggle between overview and logs
-* minor: you can press <kbd>1</kbd>, <kbd>2</kbd>, ..., to get logs of a specific package if multiple build in parallel
-
-To try it out:
-
-```console
-$ git clone https://github.com/haampie/spack-installer-ui.git
-$ cd spack-installer-ui
-$ ./spack-install.py
-$ ./spack-install.py -j4
-```
+* explicit installs remain and are displayed in bold white
+* toggling between output modes (overview / logs)
