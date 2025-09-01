@@ -57,8 +57,17 @@ OUTPUT_BUFFER_SIZE = 4096
 class JobArgs:
     """Arguments for a job to be executed."""
 
-    def __init__(self, package_name: str, duration: float, explicit: bool = False) -> None:
+    def __init__(
+        self,
+        package_name: str,
+        version: str,
+        hash_str: str,
+        duration: float,
+        explicit: bool = False,
+    ) -> None:
         self.package_name = package_name
+        self.version = version
+        self.hash_str = hash_str
         self.duration = duration
         self.explicit = explicit  # True if explicitly requested, False if dependency
 
@@ -66,9 +75,11 @@ class JobArgs:
 class PackageInfo:
     """Information about a package being built."""
 
-    def __init__(self, explicit: bool = False) -> None:
+    def __init__(self, version: str, hash_str: str, explicit: bool) -> None:
         self.state: str = "starting"
         self.explicit: bool = explicit
+        self.version: str = version
+        self.hash_str: str = hash_str
         self.finished_time: Optional[float] = None
         self.grayed_time: Optional[float] = None
 
@@ -95,10 +106,16 @@ class BuildStatus:
         self.frames_dir = "/tmp/frames"
         os.makedirs(self.frames_dir, exist_ok=True)
 
-    def add_package(self, package: str, explicit: bool = False) -> None:
+    def add_package(
+        self,
+        package: str,
+        version: str = "",
+        hash_str: str = "",
+        explicit: bool = False,
+    ) -> None:
         """Add a new package to the display and mark the display as dirty."""
         if package not in self.packages:
-            self.packages[package] = PackageInfo(explicit)
+            self.packages[package] = PackageInfo(version, hash_str, explicit)
             self.dirty = True
 
     def update_state(self, package: str, state: str) -> None:
@@ -222,24 +239,28 @@ class BuildStatus:
 
     def _format_package_line(self, package: str, pkg_info: PackageInfo) -> str:
         """Format a line for a package with proper styling."""
-        if pkg_info.state == "finished":
-            if pkg_info.grayed_time is not None:
-                indicator = "\033[2;37m[+]\033[0m"  # dim gray
-            else:
-                indicator = "\033[32m[+]\033[0m"  # green
+
+        # grayed out line
+        if pkg_info.grayed_time is not None:
+            return f"\033[2;37m[+] {pkg_info.hash_str} {package}@{pkg_info.version}\033[0m"
+
+        if pkg_info.finished_time is not None:
+            indicator = "\033[32m[+]\033[0m"  # green
             suffix = ""
         else:
-            spinner = self.spinner_chars[self.spinner_index]
-            indicator = f"[{spinner}]"
+            indicator = f"[{self.spinner_chars[self.spinner_index]}]"
             suffix = f": {pkg_info.state}"
 
-        # Apply styling based on package type and state
-        if pkg_info.grayed_time is not None:
-            package_text = f"\033[2;37m{package}{suffix}\033[0m"  # dim gray
-        elif pkg_info.explicit:
-            package_text = f"\033[1;37m{package}{suffix}\033[0m"  # bold white
+        hash_part = f"\033[0;90m{pkg_info.hash_str}\033[0m "
+        package_with_version = f"{package}\033[0;36m@{pkg_info.version}\033[0m"
+
+        # Apply styling based on package type
+        if pkg_info.explicit:
+            # Explicit package - bold white for package name, keep colors for hash and version
+            package_text = f"{hash_part}\033[1;37m{package}\033[0m\033[0;36m@{pkg_info.version}\033[0m{suffix}"
         else:
-            package_text = f"{package}{suffix}"
+            # Normal implicit package - keep original colors
+            package_text = f"{hash_part}{package_with_version}{suffix}"
 
         return f"\033[K{indicator} {package_text}"
 
@@ -547,7 +568,12 @@ def handle_job_token(
             if commands_to_run:
                 job_args = commands_to_run.pop(0)
                 start_job(job_args, child_data, fd_map)
-                build_status.add_package(job_args.package_name, job_args.explicit)
+                build_status.add_package(
+                    job_args.package_name,
+                    job_args.version,
+                    job_args.hash_str,
+                    job_args.explicit,
+                )
             else:
                 # Should not happen if read_list is empty, but as a safeguard:
                 os.write(write_fd, b"+")
@@ -606,19 +632,19 @@ def main() -> None:
     # Set up job list and data structures
     commands_to_run: List[JobArgs] = [
         # Low-level dependencies first
-        JobArgs("zlib", 2.4, explicit=False),
-        JobArgs("pcre2", 2.7, explicit=False),
-        JobArgs("sqlite", 3, explicit=False),
-        JobArgs("libffi", 1.8, explicit=False),
-        JobArgs("libxml2", 3.6, explicit=False),
-        JobArgs("openssl", 6, explicit=True),
-        JobArgs("libcurl", 4.5, explicit=False),
-        JobArgs("python", 9, explicit=True),
-        JobArgs("git", 5.4, explicit=True),
-        JobArgs("nginx", 6.6, explicit=False),
-        JobArgs("postgres", 7.5, explicit=True),
-        JobArgs("cmake", 4.2, explicit=False),
-        JobArgs("gcc", 8.4, explicit=True),
+        JobArgs("zlib", "1.2.13", "apke6t4", 2.4),
+        JobArgs("pcre2", "10.42", "hudioph", 2.7),
+        JobArgs("sqlite", "3.43.2", "gxffa7j", 3),
+        JobArgs("libffi", "3.4.4", "bievht5", 1.8),
+        JobArgs("libxml2", "2.10.3", "tjtr2mc", 3.6),
+        JobArgs("openssl", "3.1.2", "wm7k3xd", 6, explicit=True),
+        JobArgs("libcurl", "8.2.1", "nq8vh2p", 4.5),
+        JobArgs("python", "3.11.4", "uy9xm7r", 9, explicit=True),
+        JobArgs("git", "2.41.0", "fp3ka8s", 5.4, explicit=True),
+        JobArgs("nginx", "1.24.0", "lg5nt9w", 6.6),
+        JobArgs("postgres", "15.4", "zh4qb6x", 7.5, explicit=True),
+        JobArgs("cmake", "3.27.2", "mv2yc5l", 4.2),
+        JobArgs("gcc", "13.2.0", "kj8hp4z", 8.4, explicit=True),
     ]
     child_data: ChildData = {}
     fd_map: FdMap = {}
