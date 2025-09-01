@@ -48,7 +48,7 @@ from typing import Dict, List, Optional, Tuple
 SPINNER_INTERVAL = 0.1
 
 #: How long to display finished packages before graying them out
-CLEANUP_TIMEOUT = 3.0
+CLEANUP_TIMEOUT = 2.0
 
 #: Size of the output buffer for child processes
 OUTPUT_BUFFER_SIZE = 4096
@@ -611,19 +611,19 @@ def main() -> None:
     # Set up job list and data structures
     commands_to_run: List[JobArgs] = [
         # Low-level dependencies first
-        JobArgs("zlib", 0.8, explicit=False),
-        JobArgs("pcre2", 0.9, explicit=False),
-        JobArgs("sqlite", 1.0, explicit=False),
-        JobArgs("libffi", 0.6, explicit=False),
-        JobArgs("libxml2", 1.2, explicit=False),
-        JobArgs("openssl", 2.0, explicit=True),
-        JobArgs("libcurl", 1.5, explicit=False),
-        JobArgs("python", 3.0, explicit=True),
-        JobArgs("git", 1.8, explicit=True),
-        JobArgs("nginx", 2.2, explicit=False),
-        JobArgs("postgres", 2.5, explicit=True),
-        JobArgs("cmake", 1.4, explicit=False),
-        JobArgs("gcc", 2.8, explicit=True),
+        JobArgs("zlib", 2.4, explicit=False),
+        JobArgs("pcre2", 2.7, explicit=False),
+        JobArgs("sqlite", 3, explicit=False),
+        JobArgs("libffi", 1.8, explicit=False),
+        JobArgs("libxml2", 3.6, explicit=False),
+        JobArgs("openssl", 6, explicit=True),
+        JobArgs("libcurl", 4.5, explicit=False),
+        JobArgs("python", 9, explicit=True),
+        JobArgs("git", 5.4, explicit=True),
+        JobArgs("nginx", 6.6, explicit=False),
+        JobArgs("postgres", 7.5, explicit=True),
+        JobArgs("cmake", 4.2, explicit=False),
+        JobArgs("gcc", 8.4, explicit=True),
     ]
     child_data: ChildData = {}
     fd_map: FdMap = {}
