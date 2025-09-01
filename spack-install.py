@@ -47,8 +47,8 @@ from typing import Dict, List, Optional, Tuple
 #: How often to update a spinner in seconds
 SPINNER_INTERVAL = 0.1
 
-#: How long to display finished packages before cleaning them up
-CLEANUP_TIMEOUT = 1.0
+#: How long to display finished packages before graying them out
+CLEANUP_TIMEOUT = 3.0
 
 #: Size of the output buffer for child processes
 OUTPUT_BUFFER_SIZE = 4096
@@ -70,6 +70,7 @@ class PackageInfo:
         self.state: str = "starting"
         self.explicit: bool = explicit
         self.finished_time: Optional[float] = None
+        self.grayed_time: Optional[float] = None
 
 
 class BuildStatus:
@@ -88,6 +89,11 @@ class BuildStatus:
         self.last_package: Optional[str] = None  # which package log we last tracked
         self.tracked_logs = 0  # which process index to follow logs for (0-based)
         self.is_tty = sys.stdout.isatty()  # Whether stdout is a terminal
+
+        # Frame dumping setup
+        self.frame_counter = 0
+        self.frames_dir = "/tmp/frames"
+        os.makedirs(self.frames_dir, exist_ok=True)
 
     def add_package(self, package: str, explicit: bool = False) -> None:
         """Add a new package to the display and mark the display as dirty."""
@@ -113,23 +119,26 @@ class BuildStatus:
         """Update spinner and clean up finished packages."""
         if not self.is_tty:
             return
-        current_time = time.time()
+        now = time.time()
 
-        if current_time - self.last_spinner_update >= self.spinner_interval and any(
+        if now - self.last_spinner_update >= self.spinner_interval and any(
             pkg.state and pkg.state != "finished" for pkg in self.packages.values()
         ):
             self.spinner_index = (self.spinner_index + 1) % len(self.spinner_chars)
             self.dirty = True
-            self.last_spinner_update = current_time
+            self.last_spinner_update = now
 
-        # Cleanup finished packages
         packages_to_remove = []
-        for package, pkg_info in list(self.packages.items()):
-            if (
-                pkg_info.finished_time is not None
-                and current_time - pkg_info.finished_time >= cleanup_timeout
-                and not pkg_info.explicit
-            ):
+
+        for package, pkg_info in self.packages.items():
+            if pkg_info.explicit or pkg_info.finished_time is None:
+                continue
+
+            if pkg_info.grayed_time is None and now - pkg_info.finished_time >= cleanup_timeout:
+                self.packages[package].grayed_time = now
+
+            # cleanup_timeout can be 0, so no elif.
+            if pkg_info.grayed_time is not None and now - pkg_info.grayed_time >= cleanup_timeout:
                 packages_to_remove.append(package)
 
         if packages_to_remove:
@@ -187,24 +196,48 @@ class BuildStatus:
         # Print everything at once to avoid flickering
         print("".join(output_parts), end="")
 
+        # Dump frame for debugging
+        self._dump_frame()
+
         # Update the number of lines drawn for the next clear cycle
         self.last_lines_drawn = len(self.packages)
         self.dirty = False
 
+    def _dump_frame(self) -> None:
+        """Dump the current frame to a file for debugging/analysis."""
+        self.frame_counter += 1
+        frame_file = os.path.join(self.frames_dir, f"{self.frame_counter:04d}.txt")
+
+        try:
+            with open(frame_file, "w") as f:
+                # Write only the package lines without any cursor movement commands
+                for package, pkg_info in self.packages.items():
+                    if pkg_info.state:
+                        line = self._format_package_line(package, pkg_info)
+                        # Remove all ANSI escape sequences for cleaner frame files
+                        clean_line = re.sub(r"\033\[[0-9;]*[mKAB]", "", line)
+                        f.write(f"{clean_line}\n")
+        except OSError:
+            pass  # Ignore file writing errors
+
     def _format_package_line(self, package: str, pkg_info: PackageInfo) -> str:
         """Format a line for a package with proper styling."""
-        # Determine formatting components
         if pkg_info.state == "finished":
-            indicator = "\033[32m[+]\033[0m"
+            if pkg_info.grayed_time is not None:
+                indicator = "\033[2;37m[+]\033[0m"  # dim gray
+            else:
+                indicator = "\033[32m[+]\033[0m"  # green
             suffix = ""
         else:
             spinner = self.spinner_chars[self.spinner_index]
             indicator = f"[{spinner}]"
             suffix = f": {pkg_info.state}"
 
-        # Apply bold formatting for explicit packages
-        if pkg_info.explicit:
-            package_text = f"\033[1;37m{package}{suffix}\033[0m"
+        # Apply styling based on package type and state
+        if pkg_info.grayed_time is not None:
+            package_text = f"\033[2;37m{package}{suffix}\033[0m"  # dim gray
+        elif pkg_info.explicit:
+            package_text = f"\033[1;37m{package}{suffix}\033[0m"  # bold white
         else:
             package_text = f"{package}{suffix}"
 
