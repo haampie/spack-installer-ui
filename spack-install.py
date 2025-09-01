@@ -64,12 +64,14 @@ class JobArgs:
         hash_str: str,
         duration: float,
         explicit: bool = False,
+        should_fail: bool = False,
     ) -> None:
         self.package_name = package_name
         self.version = version
         self.hash_str = hash_str
         self.duration = duration
         self.explicit = explicit  # True if explicitly requested, False if dependency
+        self.should_fail = should_fail  # True if this package should fail to build
 
 
 class PackageInfo:
@@ -123,7 +125,7 @@ class BuildStatus:
         pkg_info = self.packages[package]
         pkg_info.state = state
 
-        if state == "finished":
+        if state in ("finished", "failed"):
             pkg_info.finished_time = time.time()
 
         self.dirty = True
@@ -138,8 +140,9 @@ class BuildStatus:
             return
         now = time.time()
 
+        # Only update the spinner if there are still running packages
         if now - self.last_spinner_update >= self.spinner_interval and any(
-            pkg.state and pkg.state != "finished" for pkg in self.packages.values()
+            pkg.finished_time is None for pkg in self.packages.values()
         ):
             self.spinner_index = (self.spinner_index + 1) % len(self.spinner_chars)
             self.dirty = True
@@ -148,7 +151,7 @@ class BuildStatus:
         packages_to_remove = []
 
         for package, pkg_info in self.packages.items():
-            if pkg_info.explicit or pkg_info.finished_time is None:
+            if pkg_info.explicit or pkg_info.state == "failed" or pkg_info.finished_time is None:
                 continue
 
             if pkg_info.grayed_time is None and now - pkg_info.finished_time >= cleanup_timeout:
@@ -244,7 +247,10 @@ class BuildStatus:
         if pkg_info.grayed_time is not None:
             return f"\033[2;37m[+] {pkg_info.hash_str} {package}@{pkg_info.version}\033[0m"
 
-        if pkg_info.finished_time is not None:
+        if pkg_info.state == "failed":
+            indicator = "\033[31m[x]\033[0m"  # red X
+            suffix = ""
+        elif pkg_info.state == "finished":
             indicator = "\033[32m[+]\033[0m"  # green
             suffix = ""
         else:
@@ -346,7 +352,14 @@ def worker_function(
     print("Installing files to destination...")
     print("Setting up file permissions", file=sys.stderr)
     time.sleep(stage_sleep)
-    print("Installation completed successfully")
+
+    if job_args.should_fail:
+        print("ERROR: Installation failed!", file=sys.stderr)
+        print("Build error: compilation failed with exit code 1", file=sys.stderr)
+        print("failed", file=state_pipe)
+    else:
+        print("Installation completed successfully")
+        print("finished", file=state_pipe)
 
     # Explicitly close the connections when the worker is done.
     output_w_conn.close()
@@ -496,10 +509,6 @@ def reap_children(
             # The process was already reaped or does not exist.
             print(f"Child process {pid} not found, cleaning up.", file=sys.stderr)
 
-        # If we reach here, the process is considered terminated.
-        # Update status to show finished.
-        build_status.update_state(data.package_name, "finished")
-
         # Release a job token by writing back to the FIFO.
         os.write(write_fd, b"+")
 
@@ -638,7 +647,7 @@ def main() -> None:
         JobArgs("libffi", "3.4.4", "bievht5", 1.8),
         JobArgs("libxml2", "2.10.3", "tjtr2mc", 3.6),
         JobArgs("openssl", "3.1.2", "wm7k3xd", 6, explicit=True),
-        JobArgs("libcurl", "8.2.1", "nq8vh2p", 4.5),
+        JobArgs("libcurl", "8.2.1", "nq8vh2p", 4.5, should_fail=True),
         JobArgs("python", "3.11.4", "uy9xm7r", 9, explicit=True),
         JobArgs("git", "2.41.0", "fp3ka8s", 5.4, explicit=True),
         JobArgs("nginx", "1.24.0", "lg5nt9w", 6.6),
