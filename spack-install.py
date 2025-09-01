@@ -346,7 +346,6 @@ def create_jobserver_fifo(num_jobs: int) -> Tuple[int, int]:
 
     try:
         os.mkfifo(fifo_path, 0o600)
-        print(f"Created FIFO at: {fifo_path}")
 
         # Open the read and write ends of the FIFO.
         read_fd = os.open(fifo_path, os.O_RDONLY | os.O_NONBLOCK)
@@ -357,7 +356,6 @@ def create_jobserver_fifo(num_jobs: int) -> Tuple[int, int]:
         os.rmdir(tmpdir)
 
         # Write job tokens to the pipe.
-        print(f"Writing {num_jobs} job tokens to the pipe.")
         for _ in range(num_jobs):
             os.write(write_fd, b"+")
 
@@ -390,13 +388,10 @@ def setup_jobserver(num_jobs: int) -> Tuple[int, int]:
     fifo_path = get_jobserver_fifo_path()
 
     if fifo_path is None:
-        print(f"No jobserver found in MAKEFLAGS. Creating a new one with {num_jobs} jobs.")
         read_fd, write_fd = create_jobserver_fifo(num_jobs)
     else:
-        print(f"Using existing jobserver (ignoring -j flag): {fifo_path}")
         read_fd, write_fd = open_existing_jobserver_fifo(fifo_path)
 
-    print(f"FIFO opened: read_fd={read_fd}, write_fd={write_fd}")
     return read_fd, write_fd
 
 
@@ -707,7 +702,6 @@ def main() -> None:
         if not build_status.overview_mode:
             build_status.toggle()
         build_status.redraw()
-        print("All jobs finished.")
         os.close(read_fd)
         os.close(write_fd)
         cleanup_signal_handling(signal_r, signal_w)
