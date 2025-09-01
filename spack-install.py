@@ -47,8 +47,8 @@ from typing import Dict, List, Optional, Tuple
 #: How often to update a spinner in seconds
 SPINNER_INTERVAL = 0.1
 
-#: How long to display finished packages before cleaning them up
-CLEANUP_TIMEOUT = 1.0
+#: Maximum number of finished implicit packages to keep on screen
+MAX_FINISHED_IMPLICIT = 5
 
 #: Size of the output buffer for child processes
 OUTPUT_BUFFER_SIZE = 4096
@@ -89,6 +89,11 @@ class BuildStatus:
         self.tracked_logs = 0  # which process index to follow logs for (0-based)
         self.is_tty = sys.stdout.isatty()  # Whether stdout is a terminal
 
+        # Frame dumping setup
+        self.frame_counter = 0
+        self.frames_dir = "/tmp/frames"
+        os.makedirs(self.frames_dir, exist_ok=True)
+
     def add_package(self, package: str, explicit: bool = False) -> None:
         """Add a new package to the display and mark the display as dirty."""
         if package not in self.packages:
@@ -109,8 +114,8 @@ class BuildStatus:
         if not self.is_tty:
             print(f"{package}: {state}")
 
-    def tick(self, cleanup_timeout: float = CLEANUP_TIMEOUT) -> None:
-        """Update spinner and clean up finished packages."""
+    def tick(self) -> None:
+        """Update spinner and clean up old finished implicit packages."""
         if not self.is_tty:
             return
         current_time = time.time()
@@ -122,20 +127,23 @@ class BuildStatus:
             self.dirty = True
             self.last_spinner_update = current_time
 
-        # Cleanup finished packages
-        packages_to_remove = []
-        for package, pkg_info in list(self.packages.items()):
-            if (
-                pkg_info.finished_time is not None
-                and current_time - pkg_info.finished_time >= cleanup_timeout
-                and not pkg_info.explicit
-            ):
-                packages_to_remove.append(package)
+        # Keep only the N most recent finished implicit packages
+        finished_implicit = [
+            (package, pkg_info)
+            for package, pkg_info in self.packages.items()
+            if pkg_info.finished_time is not None and not pkg_info.explicit
+        ]
 
-        if packages_to_remove:
-            for package in packages_to_remove:
+        if len(finished_implicit) > MAX_FINISHED_IMPLICIT:
+            # Sort by finished time (oldest first) and remove the oldest ones
+            finished_implicit.sort(key=lambda x: x[1].finished_time)
+            packages_to_remove = finished_implicit[:-MAX_FINISHED_IMPLICIT]
+
+            for package, _ in packages_to_remove:
                 del self.packages[package]
-            self.dirty = True
+
+            if packages_to_remove:
+                self.dirty = True
 
     def toggle(self) -> None:
         """Toggle the status display."""
@@ -176,20 +184,60 @@ class BuildStatus:
         # Build the entire output as a single string to avoid flickering
         output_parts = self._clear_instructions(self.last_lines_drawn)
 
-        # Display current active packages (if any)
-        for package, pkg_info in self.packages.items():
-            if pkg_info.state:
-                line = self._format_package_line(package, pkg_info)
-                output_parts.append(f"{line}\n")
+        # Get all packages with state and sort them by priority
+        packages_to_display = [
+            (package, pkg_info) for package, pkg_info in self.packages.items() if pkg_info.state
+        ]
+
+        def sort_key(item):
+            package, pkg_info = item
+            if pkg_info.state == "finished" and not pkg_info.explicit:
+                # Finished implicit - top, newest first
+                return (
+                    0,
+                    -(pkg_info.finished_time or 0),
+                )
+            elif pkg_info.state == "finished" and pkg_info.explicit:
+                # Finished explicit - middle
+                return (1, package)
             else:
-                output_parts.append("\033[K\n")
+                # Currently building - bottom, explicit before implicit
+                return (2, not pkg_info.explicit, package)
+
+        packages_to_display.sort(key=sort_key)
+
+        # Build the entire output as a single string to avoid flickering
+        output_parts = self._clear_instructions(self.last_lines_drawn)
+
+        for package, pkg_info in packages_to_display:
+            line = self._format_package_line(package, pkg_info)
+            output_parts.append(f"{line}\n")
 
         # Print everything at once to avoid flickering
         print("".join(output_parts), end="")
 
+        # Dump frame for debugging
+        self._dump_frame(packages_to_display)
+
         # Update the number of lines drawn for the next clear cycle
-        self.last_lines_drawn = len(self.packages)
+        self.last_lines_drawn = len(packages_to_display)
         self.dirty = False
+
+    def _dump_frame(self, packages_to_display: List[Tuple[str, PackageInfo]]) -> None:
+        """Dump the current frame to a file for debugging/analysis."""
+        self.frame_counter += 1
+        frame_file = os.path.join(self.frames_dir, f"{self.frame_counter:04d}.txt")
+
+        try:
+            with open(frame_file, "w") as f:
+                # Write only the package lines without any cursor movement commands
+                for package, pkg_info in packages_to_display:
+                    line = self._format_package_line(package, pkg_info)
+                    # Remove all ANSI escape sequences for cleaner frame files
+                    clean_line = re.sub(r"\033\[[0-9;]*[mKAB]", "", line)
+                    f.write(f"{clean_line}\n")
+        except OSError:
+            pass  # Ignore file writing errors
 
     def _format_package_line(self, package: str, pkg_info: PackageInfo) -> str:
         """Format a line for a package with proper styling."""
@@ -669,7 +717,7 @@ def main() -> None:
 
         # Clean up resources
         # Final cleanup of any remaining finished packages before exit
-        build_status.tick(cleanup_timeout=0.0)
+        build_status.tick()
         # Always switch to overview mode before exit
         if not build_status.overview_mode:
             build_status.toggle()
