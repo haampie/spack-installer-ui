@@ -214,31 +214,11 @@ class BuildStatus:
                 output_parts.append("\033[K\n")
 
         # Print everything at once to avoid flickering
-        print("".join(output_parts), end="")
-
-        # Dump frame for debugging
-        self._dump_frame()
+        print("".join(output_parts), end="", flush=True)
 
         # Update the number of lines drawn for the next clear cycle
         self.last_lines_drawn = len(self.packages)
         self.dirty = False
-
-    def _dump_frame(self) -> None:
-        """Dump the current frame to a file for debugging/analysis."""
-        self.frame_counter += 1
-        frame_file = os.path.join(self.frames_dir, f"{self.frame_counter:04d}.txt")
-
-        try:
-            with open(frame_file, "w") as f:
-                # Write only the package lines without any cursor movement commands
-                for package, pkg_info in self.packages.items():
-                    if pkg_info.state:
-                        line = self._format_package_line(package, pkg_info)
-                        # Remove all ANSI escape sequences for cleaner frame files
-                        clean_line = re.sub(r"\033\[[0-9;]*[mKAB]", "", line)
-                        f.write(f"{clean_line}\n")
-        except OSError:
-            pass  # Ignore file writing errors
 
     def _format_package_line(self, package: str, pkg_info: PackageInfo) -> str:
         """Format a line for a package with proper styling."""
