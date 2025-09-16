@@ -1,0 +1,9 @@
+[project]
+name = "spack-installer-ui"
+version = "0.1.0"
+
+[tool.black]
+line-length = 99
+
+[tool.isort]
+line_length = 99

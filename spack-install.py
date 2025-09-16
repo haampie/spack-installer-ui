@@ -31,6 +31,7 @@ with GNU Make's parallel job control system.
 
 import argparse
 import errno
+import json
 import multiprocessing
 import multiprocessing.connection
 import os
@@ -84,6 +85,7 @@ class PackageInfo:
         self.hash_str: str = hash_str
         self.finished_time: Optional[float] = None
         self.grayed_time: Optional[float] = None
+        self.progress_percent: Optional[int] = None
 
 
 class BuildStatus:
@@ -124,6 +126,7 @@ class BuildStatus:
         """Update the state of a package and mark the display as dirty."""
         pkg_info = self.packages[package]
         pkg_info.state = state
+        pkg_info.progress_percent = None
 
         if state in ("finished", "failed"):
             pkg_info.finished_time = time.time()
@@ -133,6 +136,14 @@ class BuildStatus:
         # For non-TTY output, print state changes immediately without colors
         if not self.is_tty:
             print(f"{package}: {state}")
+
+    def update_progress(self, package: str, current: int, total: int) -> None:
+        """Update the progress of a package and mark the display as dirty."""
+        percent = int((current / total) * 100)
+        pkg_info = self.packages[package]
+        if pkg_info.progress_percent != percent:
+            pkg_info.progress_percent = percent
+            self.dirty = True
 
     def tick(self, cleanup_timeout: float = CLEANUP_TIMEOUT) -> None:
         """Update spinner and clean up finished packages."""
@@ -235,7 +246,10 @@ class BuildStatus:
             suffix = ""
         else:
             indicator = f"[{self.spinner_chars[self.spinner_index]}]"
-            suffix = f": {pkg_info.state}"
+            if pkg_info.progress_percent is not None:
+                suffix = f": fetching: {pkg_info.progress_percent}%"
+            else:
+                suffix = f": {pkg_info.state}"
 
         hash_part = f"\033[0;90m{pkg_info.hash_str}\033[0m "
         package_with_version = f"{package}\033[0;36m@{pkg_info.version}\033[0m"
@@ -289,6 +303,9 @@ class ChildInfo:
 ChildData = Dict[int, ChildInfo]
 FdMap = Dict[int, FdInfo]
 
+# Buffer for incoming, partially received state data from child processes
+state_buffers: Dict[int, str] = {}
+
 
 def worker_function(
     job_args: JobArgs,
@@ -308,19 +325,40 @@ def worker_function(
     os.dup2(sys.stdout.fileno(), sys.stderr.fileno())
     state_pipe = os.fdopen(state_w, "w", buffering=1, closefd=False)
 
-    stage_sleep = job_args.duration / 3
+    def send_state(state: str) -> None:
+        """Send a state update message."""
+        json.dump({"state": state}, state_pipe, separators=(",", ":"))
+        state_pipe.write("\n")
+
+    def send_progress(current: int, total: int) -> None:
+        """Send a progress update message."""
+        json.dump({"progress": current, "total": total}, state_pipe, separators=(",", ":"))
+        state_pipe.write("\n")
+
+    stage_sleep = job_args.duration / 4
 
     print(f"Started building {job_args.package_name}")
 
+    # Download stage
+    send_state("download")
+    print("Downloading sources...")
+    total_size = 10 * 1024 * 1024  # 10MB
+    downloaded = 0
+    while downloaded < total_size:
+        time.sleep(stage_sleep / 5)
+        downloaded += total_size / 50
+        send_progress(int(downloaded), total_size)
+    print("Download completed.")
+
     # Configure stage
-    print("configure", file=state_pipe)
+    send_state("configure")
     print("Running configure scripts...")
     print("Checking dependencies and system configuration", file=sys.stderr)
     time.sleep(stage_sleep)
     print("Configure completed successfully")
 
     # Build stage
-    print("build", file=state_pipe)
+    send_state("build")
     print("Starting compilation...")
     print("Compiling source files", file=sys.stderr)
     time.sleep(stage_sleep)
@@ -328,7 +366,7 @@ def worker_function(
     print("Build completed successfully")
 
     # Install stage
-    print("install", file=state_pipe)
+    send_state("install")
     print("Installing files to destination...")
     print("Setting up file permissions", file=sys.stderr)
     time.sleep(stage_sleep)
@@ -336,10 +374,10 @@ def worker_function(
     if job_args.should_fail:
         print("ERROR: Installation failed!", file=sys.stderr)
         print("Build error: compilation failed with exit code 1", file=sys.stderr)
-        print("failed", file=state_pipe)
+        send_state("failed")
     else:
         print("Installation completed successfully")
-        print("finished", file=state_pipe)
+        send_state("finished")
 
     # Explicitly close the connections when the worker is done.
     output_w_conn.close()
@@ -441,10 +479,12 @@ def handle_child_output(
             data = os.read(r_fd, OUTPUT_BUFFER_SIZE)
         except OSError:
             del fd_map[r_fd]
+            state_buffers.pop(r_fd, None)
             continue
 
         if not data:  # EOF reached
             del fd_map[r_fd]
+            state_buffers.pop(r_fd, None)
             continue
 
         child_info = child_data[info.pid]
@@ -463,15 +503,26 @@ def handle_child_output(
                 if info.pid == target_pid:
                     build_status.logs(child_info.package_name, data.decode(errors="replace"))
         elif info.stream == "state":
-            # State changes are printed immediately.
-            # They might arrive in chunks, so we split by newline.
-            # TODO: here we assume line buffering, i.e. the state value is always followed by a
-            # newline. In reality it might also split halfway the state value and we would pass
-            # a truncated value to update_state.
-            lines = [line for line in data.decode(errors="replace").strip().split("\n") if line]
-            if lines:
-                # Only process the last state change to avoid redundant updates
-                build_status.update_state(child_info.package_name, lines[-1])
+            # Append new data to the buffer for this fd and process it
+            buffer = state_buffers.get(r_fd, "") + data.decode(errors="replace")
+            lines = buffer.split("\n")
+
+            # The last element of split() will be a partial line or an empty string.
+            # We store it back in the buffer for the next read.
+            state_buffers[r_fd] = lines.pop()
+
+            for line in lines:
+                if not line:
+                    continue
+                message = json.loads(line)
+                if "state" in message:
+                    build_status.update_state(child_info.package_name, message["state"])
+                elif "progress" in message and "total" in message:
+                    build_status.update_progress(
+                        child_info.package_name,
+                        message["progress"],
+                        message["total"],
+                    )
 
 
 def reap_children(
