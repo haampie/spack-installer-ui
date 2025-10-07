@@ -55,7 +55,7 @@ CLEANUP_TIMEOUT = 2.0
 OUTPUT_BUFFER_SIZE = 4096
 
 
-class JobArgs:
+class BuildArgs:
     """Arguments for a job to be executed."""
 
     def __init__(
@@ -311,7 +311,7 @@ state_buffers: Dict[int, str] = {}
 
 
 def worker_function(
-    job_args: JobArgs,
+    job_args: BuildArgs,
     output_w_conn: multiprocessing.connection.Connection,
     state_w_conn: multiprocessing.connection.Connection,
 ) -> None:
@@ -447,19 +447,16 @@ def setup_jobserver(num_jobs: int) -> Tuple[int, int]:
     return open_existing_jobserver_fifo(fifo_path)
 
 
-def setup_signal_handling() -> Tuple[int, int]:
+def setup_signal_handling() -> int:
     """Set up signal handling for SIGCHLD using a wakeup pipe."""
     # A handler is still needed for set_wakeup_fd to work, but it can be a no-op.
     signal.signal(signal.SIGCHLD, lambda signum, frame: None)
-
-    # Create a pipe to wake up select() on signals.
     signal_r, signal_w = os.pipe()
     os.set_blocking(signal_r, False)
     os.set_blocking(signal_w, False)
     # This will write the signal number to the pipe, waking up select().
     signal.set_wakeup_fd(signal_w)
-
-    return signal_r, signal_w
+    return signal_r
 
 
 def handle_child_output(
@@ -474,15 +471,13 @@ def handle_child_output(
         if not info:
             continue
         try:
-            # There might be more data than OUTP_BUFFER_SIZE, but we will read that in the next
-            # iteration of the event loop.
+            # There might be more data than OUTPUT_BUFFER_SIZE, but we will read that in the next
+            # iteration of the event loop to keep things responsive.
             data = os.read(r_fd, OUTPUT_BUFFER_SIZE)
         except OSError:
-            del fd_map[r_fd]
-            state_buffers.pop(r_fd, None)
-            continue
+            data = None
 
-        if not data:  # EOF reached
+        if not data:  # EOF or error
             del fd_map[r_fd]
             state_buffers.pop(r_fd, None)
             continue
@@ -496,7 +491,7 @@ def handle_child_output(
 
             # Follow the output of the process at the specified index
             child_pids = list(child_data.keys())
-            if child_pids:
+            if child_data:
                 # Clamp the tracked_logs to the available range
                 target_pid = child_pids[min(build_status.tracked_logs, len(child_pids) - 1)]
 
@@ -555,11 +550,8 @@ def reap_children(child_data: ChildData, fd_map: FdMap, write_fd: int) -> None:
         proc_data.proc.join()
 
 
-def start_job(job_args: JobArgs) -> ChildInfo:
-    """Start a new job with the given arguments.
-
-    Returns the PID, ChildInfo, output read fd, and state read fd.
-    """
+def start_build(job_args: BuildArgs) -> ChildInfo:
+    """Start a new build."""
     # Create pipes for the child's output and state reporting.
     output_r_conn, output_w_conn = multiprocessing.Pipe(duplex=False)
     state_r_conn, state_w_conn = multiprocessing.Pipe(duplex=False)
@@ -590,13 +582,6 @@ def try_acquire_token(
         return True
     except BlockingIOError:
         return False
-
-
-def cleanup_signal_handling(signal_r: int, signal_w: int) -> None:
-    """Clean up signal handling resources."""
-    old_wakeup_fd = signal.set_wakeup_fd(-1)
-    os.close(old_wakeup_fd)
-    os.close(signal_r)
 
 
 def parse_args() -> argparse.Namespace:
@@ -633,21 +618,21 @@ def main() -> None:
     jobserver_read_fd, jobserver_write_fd = setup_jobserver(args.jobs)
 
     # Set up job list and data structures
-    pending_builds: List[JobArgs] = [
+    pending_builds: List[BuildArgs] = [
         # Low-level dependencies first
-        JobArgs("zlib", "1.2.13", "apke6t4", 2.4),
-        JobArgs("pcre2", "10.42", "hudioph", 2.7),
-        JobArgs("sqlite", "3.43.2", "gxffa7j", 3),
-        JobArgs("libffi", "3.4.4", "bievht5", 1.8),
-        JobArgs("libxml2", "2.10.3", "tjtr2mc", 3.6),
-        JobArgs("openssl", "3.1.2", "wm7k3xd", 6, explicit=True),
-        JobArgs("libcurl", "8.2.1", "nq8vh2p", 4.5, should_fail=True),
-        JobArgs("python", "3.11.4", "uy9xm7r", 9, explicit=True),
-        JobArgs("git", "2.41.0", "fp3ka8s", 5.4, explicit=True),
-        JobArgs("nginx", "1.24.0", "lg5nt9w", 6.6),
-        JobArgs("postgres", "15.4", "zh4qb6x", 7.5, explicit=True),
-        JobArgs("cmake", "3.27.2", "mv2yc5l", 4.2),
-        JobArgs("gcc", "13.2.0", "kj8hp4z", 8.4, explicit=True),
+        BuildArgs("zlib", "1.2.13", "apke6t4", 2.4),
+        BuildArgs("pcre2", "10.42", "hudioph", 2.7),
+        BuildArgs("sqlite", "3.43.2", "gxffa7j", 3),
+        BuildArgs("libffi", "3.4.4", "bievht5", 1.8),
+        BuildArgs("libxml2", "2.10.3", "tjtr2mc", 3.6),
+        BuildArgs("openssl", "3.1.2", "wm7k3xd", 6, explicit=True),
+        BuildArgs("libcurl", "8.2.1", "nq8vh2p", 4.5, should_fail=True),
+        BuildArgs("python", "3.11.4", "uy9xm7r", 9, explicit=True),
+        BuildArgs("git", "2.41.0", "fp3ka8s", 5.4, explicit=True),
+        BuildArgs("nginx", "1.24.0", "lg5nt9w", 6.6),
+        BuildArgs("postgres", "15.4", "zh4qb6x", 7.5, explicit=True),
+        BuildArgs("cmake", "3.27.2", "mv2yc5l", 4.2),
+        BuildArgs("gcc", "13.2.0", "kj8hp4z", 8.4, explicit=True),
     ]
     running_builds: ChildData = {}
     fd_map: FdMap = {}
@@ -656,63 +641,38 @@ def main() -> None:
     build_status = BuildStatus()
 
     # Set up signal handling
-    signal_r, signal_w = setup_signal_handling()
+    signal_r = setup_signal_handling()
 
     # Set stdin to non-blocking for key press detection
     old_stdin_settings = termios.tcgetattr(sys.stdin)
     tty.setcbreak(sys.stdin.fileno())
 
     try:
-        # Main event loop, which reads:
-        # - stdin to toggle between overview and logs view
-        # - child process status updates
-        # - child process logs
-        # - job tokens from the jobserver FIFO
-        # - signals for child process termination
+        # Event loop that manages builds and UI updates
         while pending_builds or running_builds:
             # We wait for job tokens, signals, child output, and user input.
-            read_list = [signal_r, sys.stdin.fileno(), *fd_map.keys()]
+            read_list = [signal_r, sys.stdin.fileno(), *fd_map]
             if pending_builds:
                 read_list.append(jobserver_read_fd)
 
             readable, _, _ = select.select(read_list, (), (), SPINNER_INTERVAL)
 
+            # 1. Update the UI
             build_status.tick()
             build_status.redraw()
 
-            # Handle child process output FIRST, to avoid the race condition.
-            readable_fds = [fd for fd in readable if fd in fd_map]
-            handle_child_output(readable_fds, fd_map, running_builds, build_status)
+            # 2. Child output (logs and state updates)
+            handle_child_output(readable, fd_map, running_builds, build_status)
 
-            # Handle signals (child process termination)
+            # 3. Reap any terminated child processes
             if signal_r in readable:
-                # A signal was received, which means child processes may have terminated.
                 try:
                     os.read(signal_r, 1)
                 except BlockingIOError:
                     pass
                 reap_children(running_builds, fd_map, jobserver_write_fd)
 
-            # If builds are pending, always start one if none are running yet. For parallel builds,
-            # only start a new one if we can acquire a job token. These job tokens count the number
-            # of *leaf nodes* in the process tree, not the total number of processes. Starting the
-            # count from the second job onward ensures we don't count internal nodes.
-            if pending_builds and (not running_builds or jobserver_read_fd in readable):
-                if running_builds and not try_acquire_token(jobserver_read_fd):
-                    continue
-                job_args = pending_builds.pop(0)
-                child_info = start_job(job_args)
-                running_builds[child_info.proc.pid] = child_info
-                fd_map[child_info.output_r] = FdInfo(child_info.proc.pid, "output")
-                fd_map[child_info.state_r] = FdInfo(child_info.proc.pid, "state")
-                build_status.add_package(
-                    job_args.package_name,
-                    job_args.version,
-                    job_args.hash_str,
-                    job_args.explicit,
-                )
-
-            # Handle user input
+            # 4. Handle user input from stdin
             if sys.stdin.fileno() in readable:
                 try:
                     key = sys.stdin.read(1)
@@ -731,6 +691,26 @@ def main() -> None:
                     if build_status.overview_mode:
                         build_status.toggle()
 
+            # 5. Start new build jobs
+            # If builds are pending, always start one if none are running yet. For parallel builds,
+            # only start a new one if we can acquire a job token. These job tokens count the number
+            # of *leaf nodes* in the process tree, not the total number of processes. Starting the
+            # count from the second job onward ensures we don't count internal nodes.
+            if pending_builds and (not running_builds or jobserver_read_fd in readable):
+                if running_builds and not try_acquire_token(jobserver_read_fd):
+                    continue
+                build_args = pending_builds.pop(0)
+                child_info = start_build(build_args)
+                running_builds[child_info.proc.pid] = child_info
+                fd_map[child_info.output_r] = FdInfo(child_info.proc.pid, "output")
+                fd_map[child_info.state_r] = FdInfo(child_info.proc.pid, "state")
+                build_status.add_package(
+                    build_args.package_name,
+                    build_args.version,
+                    build_args.hash_str,
+                    build_args.explicit,
+                )
+
     finally:
         # Restore terminal settings
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_stdin_settings)
@@ -744,7 +724,9 @@ def main() -> None:
         build_status.redraw()
         os.close(jobserver_read_fd)
         os.close(jobserver_write_fd)
-        cleanup_signal_handling(signal_r, signal_w)
+        old_wakeup_fd = signal.set_wakeup_fd(-1)
+        os.close(old_wakeup_fd)
+        os.close(signal_r)
 
 
 if __name__ == "__main__":
