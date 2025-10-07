@@ -257,7 +257,10 @@ class BuildStatus:
         # Apply styling based on package type
         if pkg_info.explicit:
             # Explicit package - bold white for package name, keep colors for hash and version
-            package_text = f"{hash_part}\033[1;37m{package}\033[0m\033[0;36m@{pkg_info.version}\033[0m{suffix}"
+            package_text = (
+                f"{hash_part}\033[1;37m{package}\033[0m"
+                f"\033[0;36m@{pkg_info.version}\033[0m{suffix}"
+            )
         else:
             # Normal implicit package - keep original colors
             package_text = f"{hash_part}{package_with_version}{suffix}"
@@ -408,7 +411,7 @@ def create_jobserver_fifo(num_jobs: int) -> Tuple[int, int]:
         os.rmdir(tmpdir)
 
         # Write job tokens to the pipe.
-        for _ in range(num_jobs):
+        for _ in range(num_jobs - 1):
             os.write(write_fd, b"+")
 
         return read_fd, write_fd
@@ -440,11 +443,8 @@ def setup_jobserver(num_jobs: int) -> Tuple[int, int]:
     fifo_path = get_jobserver_fifo_path()
 
     if fifo_path is None:
-        read_fd, write_fd = create_jobserver_fifo(num_jobs)
-    else:
-        read_fd, write_fd = open_existing_jobserver_fifo(fifo_path)
-
-    return read_fd, write_fd
+        return create_jobserver_fifo(num_jobs)
+    return open_existing_jobserver_fifo(fifo_path)
 
 
 def setup_signal_handling() -> Tuple[int, int]:
@@ -525,20 +525,17 @@ def handle_child_output(
                     )
 
 
-def reap_children(
-    child_data: ChildData, fd_map: FdMap, write_fd: int, build_status: BuildStatus
-) -> None:
-    """Reap terminated child processes, print their output, and clean up resources."""
-    for pid, data in list(child_data.items()):
+def reap_children(child_data: ChildData, fd_map: FdMap, write_fd: int) -> None:
+    """Reap terminated child processes"""
+    while True:
         try:
-            # Check process status without blocking.
-            wait_pid, _ = os.waitpid(pid, os.WNOHANG)
-            if wait_pid == 0:
-                # This child has not terminated yet.
+            pid, _ = os.waitpid(-1, os.WNOHANG)
+            if pid == 0:
+                break
+            elif pid not in child_data:
                 continue
         except ChildProcessError:
-            # The process was already reaped or does not exist.
-            print(f"Child process {pid} not found, cleaning up.", file=sys.stderr)
+            break
 
         # Release a job token by writing back to the FIFO.
         os.write(write_fd, b"+")
@@ -558,8 +555,11 @@ def reap_children(
         proc_data.proc.join()
 
 
-def start_job(job_args: JobArgs, child_data: ChildData, fd_map: FdMap) -> None:
-    """Start a new job with the given arguments."""
+def start_job(job_args: JobArgs) -> ChildInfo:
+    """Start a new job with the given arguments.
+
+    Returns the PID, ChildInfo, output read fd, and state read fd.
+    """
     # Create pipes for the child's output and state reporting.
     output_r_conn, output_w_conn = multiprocessing.Pipe(duplex=False)
     state_r_conn, state_w_conn = multiprocessing.Pipe(duplex=False)
@@ -574,59 +574,22 @@ def start_job(job_args: JobArgs, child_data: ChildData, fd_map: FdMap) -> None:
     output_w_conn.close()
     state_w_conn.close()
 
-    # Get the integer file descriptors for the read ends for select().
-    output_r = output_r_conn.fileno()
-    state_r = state_r_conn.fileno()
+    # Set the read ends to non-blocking: in principle redundant with select(), but safer.
+    os.set_blocking(output_r_conn.fileno(), False)
+    os.set_blocking(state_r_conn.fileno(), False)
 
-    # Set the read ends to non-blocking.
-    os.set_blocking(output_r, False)
-    os.set_blocking(state_r, False)
-
-    # After start(), proc.pid should be available
-    assert proc.pid is not None, "Process PID should be available after start()"
-    pid = proc.pid
-
-    child_data[pid] = ChildInfo(
-        proc, job_args.package_name, output_r_conn, state_r_conn, job_args.explicit
-    )
-    fd_map[output_r] = FdInfo(pid, "output")
-    fd_map[state_r] = FdInfo(pid, "state")
+    return ChildInfo(proc, job_args.package_name, output_r_conn, state_r_conn, job_args.explicit)
 
 
-def handle_job_token(
+def try_acquire_token(
     read_fd: int,
-    write_fd: int,
-    commands_to_run: List[JobArgs],
-    child_data: ChildData,
-    fd_map: FdMap,
-    build_status: BuildStatus,
 ) -> bool:
     """Handle acquiring a job token and starting a new job if available."""
     try:
-        token = os.read(read_fd, 1)
-        if token:
-            if commands_to_run:
-                job_args = commands_to_run.pop(0)
-                start_job(job_args, child_data, fd_map)
-                build_status.add_package(
-                    job_args.package_name,
-                    job_args.version,
-                    job_args.hash_str,
-                    job_args.explicit,
-                )
-            else:
-                # Should not happen if read_list is empty, but as a safeguard:
-                os.write(write_fd, b"+")
-        else:
-            # Reading 0 bytes means the write end of the FIFO was closed.
-            print("Jobserver has closed the pipe. Exiting.", file=sys.stderr)
-            return False
-    except OSError as e:
-        # EAGAIN/EWOULDBLOCK means the read would block, should not happen with select.
-        if e.errno != errno.EAGAIN and e.errno != errno.EWOULDBLOCK:
-            print(f"Error reading from FIFO: {e}", file=sys.stderr)
-            return False
-    return True
+        os.read(read_fd, 1)
+        return True
+    except BlockingIOError:
+        return False
 
 
 def cleanup_signal_handling(signal_r: int, signal_w: int) -> None:
@@ -667,10 +630,10 @@ def main() -> None:
     args = parse_args()
 
     # Set up the jobserver FIFO
-    read_fd, write_fd = setup_jobserver(args.jobs)
+    jobserver_read_fd, jobserver_write_fd = setup_jobserver(args.jobs)
 
     # Set up job list and data structures
-    commands_to_run: List[JobArgs] = [
+    pending_builds: List[JobArgs] = [
         # Low-level dependencies first
         JobArgs("zlib", "1.2.13", "apke6t4", 2.4),
         JobArgs("pcre2", "10.42", "hudioph", 2.7),
@@ -686,7 +649,7 @@ def main() -> None:
         JobArgs("cmake", "3.27.2", "mv2yc5l", 4.2),
         JobArgs("gcc", "13.2.0", "kj8hp4z", 8.4, explicit=True),
     ]
-    child_data: ChildData = {}
+    running_builds: ChildData = {}
     fd_map: FdMap = {}
 
     # Initialize build status display
@@ -706,11 +669,11 @@ def main() -> None:
         # - child process logs
         # - job tokens from the jobserver FIFO
         # - signals for child process termination
-        while commands_to_run or child_data:
+        while pending_builds or running_builds:
             # We wait for job tokens, signals, child output, and user input.
             read_list = [signal_r, sys.stdin.fileno(), *fd_map.keys()]
-            if commands_to_run:
-                read_list.append(read_fd)
+            if pending_builds:
+                read_list.append(jobserver_read_fd)
 
             readable, _, _ = select.select(read_list, (), (), SPINNER_INTERVAL)
 
@@ -719,24 +682,35 @@ def main() -> None:
 
             # Handle child process output FIRST, to avoid the race condition.
             readable_fds = [fd for fd in readable if fd in fd_map]
-            handle_child_output(readable_fds, fd_map, child_data, build_status)
+            handle_child_output(readable_fds, fd_map, running_builds, build_status)
 
             # Handle signals (child process termination)
             if signal_r in readable:
-                # A signal was received. Read from the pipe to clear it.
+                # A signal was received, which means child processes may have terminated.
                 try:
                     os.read(signal_r, 1)
                 except BlockingIOError:
-                    pass  # This can happen if the pipe was already drained.
+                    pass
+                reap_children(running_builds, fd_map, jobserver_write_fd)
 
-                reap_children(child_data, fd_map, write_fd, build_status)
-
-            # Handle job tokens
-            if read_fd in readable:
-                if not handle_job_token(
-                    read_fd, write_fd, commands_to_run, child_data, fd_map, build_status
-                ):
-                    break
+            # If builds are pending, always start one if none are running yet. For parallel builds,
+            # only start a new one if we can acquire a job token. These job tokens count the number
+            # of *leaf nodes* in the process tree, not the total number of processes. Starting the
+            # count from the second job onward ensures we don't count internal nodes.
+            if pending_builds and (not running_builds or jobserver_read_fd in readable):
+                if running_builds and not try_acquire_token(jobserver_read_fd):
+                    continue
+                job_args = pending_builds.pop(0)
+                child_info = start_job(job_args)
+                running_builds[child_info.proc.pid] = child_info
+                fd_map[child_info.output_r] = FdInfo(child_info.proc.pid, "output")
+                fd_map[child_info.state_r] = FdInfo(child_info.proc.pid, "state")
+                build_status.add_package(
+                    job_args.package_name,
+                    job_args.version,
+                    job_args.hash_str,
+                    job_args.explicit,
+                )
 
             # Handle user input
             if sys.stdin.fileno() in readable:
@@ -768,8 +742,8 @@ def main() -> None:
         if not build_status.overview_mode:
             build_status.toggle()
         build_status.redraw()
-        os.close(read_fd)
-        os.close(write_fd)
+        os.close(jobserver_read_fd)
+        os.close(jobserver_write_fd)
         cleanup_signal_handling(signal_r, signal_w)
 
 
