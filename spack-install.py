@@ -347,10 +347,10 @@ def worker_function(
             dst.write(src.read())
         os.chdir(build_dir)
 
-        send_state(f"build {os.getpid()}")
+        send_state(f"build")
         subprocess.run(["make"])
 
-        send_state(f"install {os.getpid()}")
+        send_state(f"install")
         subprocess.run(["make", "install"])
 
         if job_args.should_fail:
@@ -359,7 +359,7 @@ def worker_function(
             send_state("failed")
         else:
             print("Installation completed successfully")
-            send_state(f"finished {os.getpid()}")
+            send_state(f"finished")
 
     # Explicitly close the connections when the worker is done.
     output_w_conn.close()
@@ -499,32 +499,24 @@ def handle_child_output(
 
 def reap_children(child_data: Dict[int, ChildInfo], fd_map: Dict[int, FdInfo], jobserver_write_fd: int) -> None:
     """Reap terminated child processes"""
-    for pid, data in list(child_data.items()):
-        try:
-            wait_pid, _ = os.waitpid(data.proc.pid, os.WNOHANG)
-            if wait_pid == 0:
-                continue
-        except ChildProcessError as e:
-            print(f"OOPS {pid}: {e}")
-
-        print(f"Reaping child process {pid}")
+    for pid in list(child_data):
+        child = child_data[pid]
+        if child.proc.is_alive():
+            continue
 
         # Release a job token by writing back to the FIFO.
         os.write(jobserver_write_fd, b"+")
 
         # Clean up all data associated with the terminated process.
-        proc_data = child_data.pop(pid)
-
-        # Close the parent's read-ends of the pipes via the connection objects.
-        proc_data.output_r_conn.close()
-        proc_data.state_r_conn.close()
+        child.output_r_conn.close()
+        child.state_r_conn.close()
 
         # Remove from fd_map if they haven't been removed already (on EOF).
-        fd_map.pop(proc_data.output_r, None)
-        fd_map.pop(proc_data.state_r, None)
+        fd_map.pop(child.output_r, None)
+        fd_map.pop(child.state_r, None)
 
-        # Ensure the multiprocessing.Process object is cleaned up.
-        proc_data.proc.join()
+        child.proc.join()
+        del child_data[pid]
 
 
 def start_build(job_args: BuildArgs) -> ChildInfo:
