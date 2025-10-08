@@ -34,6 +34,7 @@ import errno
 import json
 import multiprocessing
 import multiprocessing.connection
+import subprocess
 import os
 import re
 import select
@@ -73,6 +74,9 @@ class BuildArgs:
         self.duration = duration
         self.explicit = explicit  # True if explicitly requested, False if dependency
         self.should_fail = should_fail  # True if this package should fail to build
+
+    def __repr__(self):
+        return f"BuildArgs(package_name={self.package_name}, explicit={self.explicit}, should_fail={self.should_fail})"
 
 
 class PackageInfo:
@@ -267,19 +271,20 @@ class BuildStatus:
 
         return f"\033[K{indicator} {package_text}"
 
-    def logs(self, package: str, data: str) -> None:
+    def logs(self, package: str, data: bytes) -> None:
         if self.last_package != package:
             self.last_package = package
             print(f"\nTracking {package} logs:\n", end="")
-        print(data, end="")
+        sys.stdout.buffer.write(data)
+        sys.stdout.flush()
 
 
 class FdInfo:
     """Information about a file descriptor mapping."""
 
-    def __init__(self, pid: int, stream: str) -> None:
+    def __init__(self, pid: int, name: str) -> None:
         self.pid = pid
-        self.stream = stream
+        self.name = name
 
 
 class ChildInfo:
@@ -300,11 +305,9 @@ class ChildInfo:
         self.output_r = output_r_conn.fileno()
         self.state_r = state_r_conn.fileno()
         self.explicit = explicit
-
-
-# Type aliases for collections
-ChildData = Dict[int, ChildInfo]
-FdMap = Dict[int, FdInfo]
+    
+    def __repr__(self):
+        return f"ChildInfo(pid={self.proc.pid}, package_name={self.package_name}, explicit={self.explicit})"
 
 # Buffer for incoming, partially received state data from child processes
 state_buffers: Dict[int, str] = {}
@@ -320,12 +323,12 @@ def worker_function(
     output_w = output_w_conn.fileno()
     state_w = state_w_conn.fileno()
 
-    # In the child process, re-open stdout to use the pipe.
-    # Use line-buffering (buffering=1).
+    # In the child process, re-open stdout to use the pipe with line-buffering.
     # Set closefd=False so fdopen doesn't close the fd owned by the Connection.
-    sys.stdout = os.fdopen(output_w, "w", buffering=1, closefd=False)
     # Redirect stderr to stdout.
-    os.dup2(sys.stdout.fileno(), sys.stderr.fileno())
+    os.dup2(output_w, sys.stdout.fileno())
+    os.dup2(output_w, sys.stderr.fileno())
+
     state_pipe = os.fdopen(state_w, "w", buffering=1, closefd=False)
 
     def send_state(state: str) -> None:
@@ -338,49 +341,25 @@ def worker_function(
         json.dump({"progress": current, "total": total}, state_pipe, separators=(",", ":"))
         state_pipe.write("\n")
 
-    stage_sleep = job_args.duration / 4
+    with tempfile.TemporaryDirectory() as build_dir:
+        makefile_path = os.path.join(build_dir, "Makefile")
+        with open("example.mk", "r") as src, open(makefile_path, "w") as dst:
+            dst.write(src.read())
+        os.chdir(build_dir)
 
-    print(f"Started building {job_args.package_name}")
+        send_state(f"build {os.getpid()}")
+        subprocess.run(["make"])
 
-    # Download stage
-    send_state("download")
-    print("Downloading sources...")
-    total_size = 10 * 1024 * 1024  # 10MB
-    downloaded = 0
-    while downloaded < total_size:
-        time.sleep(stage_sleep / 5)
-        downloaded += total_size / 50
-        send_progress(int(downloaded), total_size)
-    print("Download completed.")
+        send_state(f"install {os.getpid()}")
+        subprocess.run(["make", "install"])
 
-    # Configure stage
-    send_state("configure")
-    print("Running configure scripts...")
-    print("Checking dependencies and system configuration", file=sys.stderr)
-    time.sleep(stage_sleep)
-    print("Configure completed successfully")
-
-    # Build stage
-    send_state("build")
-    print("Starting compilation...")
-    print("Compiling source files", file=sys.stderr)
-    time.sleep(stage_sleep)
-    print("Linking object files...")
-    print("Build completed successfully")
-
-    # Install stage
-    send_state("install")
-    print("Installing files to destination...")
-    print("Setting up file permissions", file=sys.stderr)
-    time.sleep(stage_sleep)
-
-    if job_args.should_fail:
-        print("ERROR: Installation failed!", file=sys.stderr)
-        print("Build error: compilation failed with exit code 1", file=sys.stderr)
-        send_state("failed")
-    else:
-        print("Installation completed successfully")
-        send_state("finished")
+        if job_args.should_fail:
+            print("ERROR: Installation failed!", file=sys.stderr)
+            print("Build error: compilation failed with exit code 1", file=sys.stderr)
+            send_state("failed")
+        else:
+            print("Installation completed successfully")
+            send_state(f"finished {os.getpid()}")
 
     # Explicitly close the connections when the worker is done.
     output_w_conn.close()
@@ -406,13 +385,11 @@ def create_jobserver_fifo(num_jobs: int) -> Tuple[int, int]:
         read_fd = os.open(fifo_path, os.O_RDONLY | os.O_NONBLOCK)
         write_fd = os.open(fifo_path, os.O_WRONLY)
 
-        # Unlink the file so it's removed when we're done.
-        os.unlink(fifo_path)
-        os.rmdir(tmpdir)
-
         # Write job tokens to the pipe.
         for _ in range(num_jobs - 1):
             os.write(write_fd, b"+")
+
+        os.environ["MAKEFLAGS"] = f" -j{num_jobs} --jobserver-auth=fifo:{fifo_path}"
 
         return read_fd, write_fd
 
@@ -461,8 +438,8 @@ def setup_signal_handling() -> int:
 
 def handle_child_output(
     readable_fds: List[int],
-    fd_map: FdMap,
-    child_data: ChildData,
+    fd_map: Dict[int, FdInfo],
+    child_data: Dict[int, ChildInfo],
     build_status: BuildStatus,
 ) -> None:
     """Handle reading output from child process pipes."""
@@ -484,7 +461,7 @@ def handle_child_output(
 
         child_info = child_data[info.pid]
 
-        if info.stream == "output":
+        if info.name == "output":
             # In overview mode, we discard logs from the child processes.
             if build_status.overview_mode:
                 return
@@ -496,8 +473,8 @@ def handle_child_output(
                 target_pid = child_pids[min(build_status.tracked_logs, len(child_pids) - 1)]
 
                 if info.pid == target_pid:
-                    build_status.logs(child_info.package_name, data.decode(errors="replace"))
-        elif info.stream == "state":
+                    build_status.logs(child_info.package_name, data)
+        elif info.name == "state":
             # Append new data to the buffer for this fd and process it
             buffer = state_buffers.get(r_fd, "") + data.decode(errors="replace")
             lines = buffer.split("\n")
@@ -520,20 +497,20 @@ def handle_child_output(
                     )
 
 
-def reap_children(child_data: ChildData, fd_map: FdMap, write_fd: int) -> None:
+def reap_children(child_data: Dict[int, ChildInfo], fd_map: Dict[int, FdInfo], jobserver_write_fd: int) -> None:
     """Reap terminated child processes"""
-    while True:
+    for pid, data in list(child_data.items()):
         try:
-            pid, _ = os.waitpid(-1, os.WNOHANG)
-            if pid == 0:
-                break
-            elif pid not in child_data:
+            wait_pid, _ = os.waitpid(data.proc.pid, os.WNOHANG)
+            if wait_pid == 0:
                 continue
-        except ChildProcessError:
-            break
+        except ChildProcessError as e:
+            print(f"OOPS {pid}: {e}")
+
+        print(f"Reaping child process {pid}")
 
         # Release a job token by writing back to the FIFO.
-        os.write(write_fd, b"+")
+        os.write(jobserver_write_fd, b"+")
 
         # Clean up all data associated with the terminated process.
         proc_data = child_data.pop(pid)
@@ -634,8 +611,8 @@ def main() -> None:
         BuildArgs("cmake", "3.27.2", "mv2yc5l", 4.2),
         BuildArgs("gcc", "13.2.0", "kj8hp4z", 8.4, explicit=True),
     ]
-    running_builds: ChildData = {}
-    fd_map: FdMap = {}
+    running_builds: Dict[int, ChildInfo] = {}
+    fd_map: Dict[int, FdInfo] = {}
 
     # Initialize build status display
     build_status = BuildStatus()
@@ -647,9 +624,13 @@ def main() -> None:
     old_stdin_settings = termios.tcgetattr(sys.stdin)
     tty.setcbreak(sys.stdin.fileno())
 
+    iteration = 0
+
     try:
         # Event loop that manages builds and UI updates
         while pending_builds or running_builds:
+            iteration += 1
+            # print(f"--- Event loop iteration {iteration} ---", file=sys.stderr)
             # We wait for job tokens, signals, child output, and user input.
             read_list = [signal_r, sys.stdin.fileno(), *fd_map]
             if pending_builds:
@@ -660,6 +641,9 @@ def main() -> None:
             # 1. Update the UI
             build_status.tick()
             build_status.redraw()
+
+            if not readable:
+                continue
 
             # 2. Child output (logs and state updates)
             handle_child_output(readable, fd_map, running_builds, build_status)
