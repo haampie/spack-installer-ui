@@ -30,15 +30,14 @@ with GNU Make's parallel job control system.
 """
 
 import argparse
-import errno
 import json
 import multiprocessing
 import multiprocessing.connection
-import subprocess
 import os
 import re
 import select
 import signal
+import subprocess
 import sys
 import tempfile
 import termios
@@ -74,9 +73,6 @@ class BuildArgs:
         self.duration = duration
         self.explicit = explicit  # True if explicitly requested, False if dependency
         self.should_fail = should_fail  # True if this package should fail to build
-
-    def __repr__(self):
-        return f"BuildArgs(package_name={self.package_name}, explicit={self.explicit}, should_fail={self.should_fail})"
 
 
 class PackageInfo:
@@ -305,9 +301,7 @@ class ChildInfo:
         self.output_r = output_r_conn.fileno()
         self.state_r = state_r_conn.fileno()
         self.explicit = explicit
-    
-    def __repr__(self):
-        return f"ChildInfo(pid={self.proc.pid}, package_name={self.package_name}, explicit={self.explicit})"
+
 
 # Buffer for incoming, partially received state data from child processes
 state_buffers: Dict[int, str] = {}
@@ -347,10 +341,10 @@ def worker_function(
             dst.write(src.read())
         os.chdir(build_dir)
 
-        send_state(f"build")
+        send_state("build")
         subprocess.run(["make"])
 
-        send_state(f"install")
+        send_state("install")
         subprocess.run(["make", "install"])
 
         if job_args.should_fail:
@@ -359,7 +353,7 @@ def worker_function(
             send_state("failed")
         else:
             print("Installation completed successfully")
-            send_state(f"finished")
+            send_state("finished")
 
     # Explicitly close the connections when the worker is done.
     output_w_conn.close()
@@ -380,17 +374,10 @@ def create_jobserver_fifo(num_jobs: int) -> Tuple[int, int]:
 
     try:
         os.mkfifo(fifo_path, 0o600)
-
-        # Open the read and write ends of the FIFO.
         read_fd = os.open(fifo_path, os.O_RDONLY | os.O_NONBLOCK)
         write_fd = os.open(fifo_path, os.O_WRONLY)
-
-        # Write job tokens to the pipe.
-        for _ in range(num_jobs - 1):
-            os.write(write_fd, b"+")
-
+        os.write(write_fd, b"+" * (num_jobs - 1))
         os.environ["MAKEFLAGS"] = f" -j{num_jobs} --jobserver-auth=fifo:{fifo_path}"
-
         return read_fd, write_fd
 
     except OSError as e:
@@ -497,15 +484,20 @@ def handle_child_output(
                     )
 
 
-def reap_children(child_data: Dict[int, ChildInfo], fd_map: Dict[int, FdInfo], jobserver_write_fd: int) -> None:
+def reap_children(
+    child_data: Dict[int, ChildInfo], fd_map: Dict[int, FdInfo], jobserver_write_fd: int
+) -> None:
     """Reap terminated child processes"""
+    global tokens_acquired
     for pid in list(child_data):
         child = child_data[pid]
         if child.proc.is_alive():
             continue
 
-        # Release a job token by writing back to the FIFO.
-        os.write(jobserver_write_fd, b"+")
+        # Release a job token when this is not the last job (which has an implicit token)
+        if tokens_acquired > 1:
+            os.write(jobserver_write_fd, b"+")
+            tokens_acquired -= 1
 
         # Clean up all data associated with the terminated process.
         child.output_r_conn.close()
@@ -546,8 +538,10 @@ def try_acquire_token(
     read_fd: int,
 ) -> bool:
     """Handle acquiring a job token and starting a new job if available."""
+    global tokens_acquired
     try:
         os.read(read_fd, 1)
+        tokens_acquired += 1
         return True
     except BlockingIOError:
         return False
@@ -577,6 +571,7 @@ Note: The -j flag is ignored when running under an existing GNU Make jobserver.
     )
     return parser.parse_args()
 
+tokens_acquired = 0
 
 def main() -> None:
     """Main function implementing select-based event loop for GNU Make jobserver client."""
@@ -595,7 +590,7 @@ def main() -> None:
         BuildArgs("libffi", "3.4.4", "bievht5", 1.8),
         BuildArgs("libxml2", "2.10.3", "tjtr2mc", 3.6),
         BuildArgs("openssl", "3.1.2", "wm7k3xd", 6, explicit=True),
-        BuildArgs("libcurl", "8.2.1", "nq8vh2p", 4.5, should_fail=True),
+        BuildArgs("libcurl", "8.2.1", "nq8vh2p", 4.5),
         BuildArgs("python", "3.11.4", "uy9xm7r", 9, explicit=True),
         BuildArgs("git", "2.41.0", "fp3ka8s", 5.4, explicit=True),
         BuildArgs("nginx", "1.24.0", "lg5nt9w", 6.6),
@@ -616,13 +611,9 @@ def main() -> None:
     old_stdin_settings = termios.tcgetattr(sys.stdin)
     tty.setcbreak(sys.stdin.fileno())
 
-    iteration = 0
-
     try:
         # Event loop that manages builds and UI updates
         while pending_builds or running_builds:
-            iteration += 1
-            # print(f"--- Event loop iteration {iteration} ---", file=sys.stderr)
             # We wait for job tokens, signals, child output, and user input.
             read_list = [signal_r, sys.stdin.fileno(), *fd_map]
             if pending_builds:
@@ -633,9 +624,6 @@ def main() -> None:
             # 1. Update the UI
             build_status.tick()
             build_status.redraw()
-
-            if not readable:
-                continue
 
             # 2. Child output (logs and state updates)
             handle_child_output(readable, fd_map, running_builds, build_status)
