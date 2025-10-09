@@ -63,14 +63,12 @@ class BuildArgs:
         package_name: str,
         version: str,
         hash_str: str,
-        duration: float,
         explicit: bool = False,
         should_fail: bool = False,
     ) -> None:
         self.package_name = package_name
         self.version = version
         self.hash_str = hash_str
-        self.duration = duration
         self.explicit = explicit  # True if explicitly requested, False if dependency
         self.should_fail = should_fail  # True if this package should fail to build
 
@@ -348,12 +346,10 @@ def worker_function(
         subprocess.run(["make", "install"])
 
         if job_args.should_fail:
-            print("ERROR: Installation failed!", file=sys.stderr)
-            print("Build error: compilation failed with exit code 1", file=sys.stderr)
-            send_state("failed")
-        else:
-            print("Installation completed successfully")
-            send_state("finished")
+            raise Exception("Oh no!!")
+
+        print("Installation completed successfully")
+        send_state("finished")
 
     # Explicitly close the connections when the worker is done.
     output_w_conn.close()
@@ -486,29 +482,26 @@ def handle_child_output(
 
 def reap_children(
     child_data: Dict[int, ChildInfo], fd_map: Dict[int, FdInfo], jobserver_write_fd: int
-) -> None:
+) -> List[int]:
     """Reap terminated child processes"""
     global tokens_acquired
-    for pid in list(child_data):
-        child = child_data[pid]
+    to_delete: List[int] = []
+    for pid, child in child_data.items():
         if child.proc.is_alive():
             continue
+        to_delete.append(pid)
 
         # Release a job token when this is not the last job (which has an implicit token)
+        # Close the pipes and remove from fd_map (if not already done by handle_child_output)
         if tokens_acquired > 1:
             os.write(jobserver_write_fd, b"+")
             tokens_acquired -= 1
-
-        # Clean up all data associated with the terminated process.
         child.output_r_conn.close()
         child.state_r_conn.close()
-
-        # Remove from fd_map if they haven't been removed already (on EOF).
         fd_map.pop(child.output_r, None)
         fd_map.pop(child.state_r, None)
-
         child.proc.join()
-        del child_data[pid]
+    return to_delete
 
 
 def start_build(job_args: BuildArgs) -> ChildInfo:
@@ -571,7 +564,9 @@ Note: The -j flag is ignored when running under an existing GNU Make jobserver.
     )
     return parser.parse_args()
 
+
 tokens_acquired = 0
+
 
 def main() -> None:
     """Main function implementing select-based event loop for GNU Make jobserver client."""
@@ -584,19 +579,19 @@ def main() -> None:
     # Set up job list and data structures
     pending_builds: List[BuildArgs] = [
         # Low-level dependencies first
-        BuildArgs("zlib", "1.2.13", "apke6t4", 2.4),
-        BuildArgs("pcre2", "10.42", "hudioph", 2.7),
-        BuildArgs("sqlite", "3.43.2", "gxffa7j", 3),
-        BuildArgs("libffi", "3.4.4", "bievht5", 1.8),
-        BuildArgs("libxml2", "2.10.3", "tjtr2mc", 3.6),
-        BuildArgs("openssl", "3.1.2", "wm7k3xd", 6, explicit=True),
-        BuildArgs("libcurl", "8.2.1", "nq8vh2p", 4.5),
-        BuildArgs("python", "3.11.4", "uy9xm7r", 9, explicit=True),
-        BuildArgs("git", "2.41.0", "fp3ka8s", 5.4, explicit=True),
-        BuildArgs("nginx", "1.24.0", "lg5nt9w", 6.6),
-        BuildArgs("postgres", "15.4", "zh4qb6x", 7.5, explicit=True),
-        BuildArgs("cmake", "3.27.2", "mv2yc5l", 4.2),
-        BuildArgs("gcc", "13.2.0", "kj8hp4z", 8.4, explicit=True),
+        BuildArgs("zlib", "1.2.13", "apke6t4", should_fail=True),
+        BuildArgs("pcre2", "10.42", "hudioph"),
+        BuildArgs("sqlite", "3.43.2", "gxffa7j"),
+        BuildArgs("libffi", "3.4.4", "bievht5"),
+        BuildArgs("libxml2", "2.10.3", "tjtr2mc"),
+        BuildArgs("openssl", "3.1.2", "wm7k3xd", explicit=True),
+        BuildArgs("libcurl", "8.2.1", "nq8vh2p"),
+        BuildArgs("python", "3.11.4", "uy9xm7r", explicit=True),
+        BuildArgs("git", "2.41.0", "fp3ka8s", explicit=True),
+        BuildArgs("nginx", "1.24.0", "lg5nt9w"),
+        BuildArgs("postgres", "15.4", "zh4qb6x", explicit=True),
+        BuildArgs("cmake", "3.27.2", "mv2yc5l"),
+        BuildArgs("gcc", "13.2.0", "kj8hp4z", explicit=True),
     ]
     running_builds: Dict[int, ChildInfo] = {}
     fd_map: Dict[int, FdInfo] = {}
@@ -634,7 +629,10 @@ def main() -> None:
                     os.read(signal_r, 1)
                 except BlockingIOError:
                     pass
-                reap_children(running_builds, fd_map, jobserver_write_fd)
+                for pid in reap_children(running_builds, fd_map, jobserver_write_fd):
+                    child = running_builds.pop(pid)
+                    if child.proc.exitcode != 0:
+                        build_status.update_state(child.package_name, "failed")
 
             # 4. Handle user input from stdin
             if sys.stdin.fileno() in readable:
