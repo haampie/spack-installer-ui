@@ -102,11 +102,6 @@ class BuildStatus:
         self.tracked_build_id = ""  # identifier of the package whose logs we follow
         self.is_tty = sys.stdout.isatty()  # Whether stdout is a terminal
 
-        # Frame dumping setup
-        self.frame_counter = 0
-        self.frames_dir = "/tmp/frames"
-        os.makedirs(self.frames_dir, exist_ok=True)
-
     def add_build(
         self,
         build_id: str,
@@ -286,6 +281,8 @@ class BuildStatus:
 
 class FdInfo:
     """Information about a file descriptor mapping."""
+
+    __slots__ = ("pid", "name")
 
     def __init__(self, pid: int, name: str) -> None:
         self.pid = pid
