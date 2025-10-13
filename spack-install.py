@@ -630,9 +630,9 @@ def main() -> None:
                 except BlockingIOError:
                     pass
                 for pid in reap_children(running_builds, fd_map, jobserver_write_fd):
-                    child = running_builds.pop(pid)
-                    if child.proc.exitcode != 0:
-                        build_status.update_state(child.package_name, "failed")
+                    build = running_builds.pop(pid)
+                    if build.proc.exitcode != 0:
+                        build_status.update_state(build.package_name, "failed")
 
             # 4. Handle user input from stdin
             if sys.stdin.fileno() in readable:
