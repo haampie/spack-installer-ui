@@ -76,6 +76,16 @@ class BuildArgs:
 class BuildInfo:
     """Information about a package being built."""
 
+    __slots__ = (
+        "state",
+        "explicit",
+        "version",
+        "hash_str",
+        "finished_time",
+        "grayed_time",
+        "progress_percent",
+    )
+
     def __init__(self, version: str, hash_str: str, explicit: bool) -> None:
         self.state: str = "starting"
         self.explicit: bool = explicit
@@ -291,6 +301,16 @@ class FdInfo:
 
 class ChildInfo:
     """Information about a child process."""
+
+    __slots__ = (
+        "proc",
+        "package_name",
+        "output_r_conn",
+        "state_r_conn",
+        "output_r",
+        "state_r",
+        "explicit",
+    )
 
     def __init__(
         self,
