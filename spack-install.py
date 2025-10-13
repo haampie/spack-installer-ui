@@ -521,8 +521,6 @@ def reap_children(
         if tokens_acquired > 1:
             os.write(jobserver_write_fd, b"+")
             tokens_acquired -= 1
-        child.output_r_conn.close()
-        child.state_r_conn.close()
         try:
             selector.unregister(child.output_r)
         except KeyError:
@@ -531,6 +529,8 @@ def reap_children(
             selector.unregister(child.state_r)
         except KeyError:
             pass
+        child.output_r_conn.close()
+        child.state_r_conn.close()
         child.proc.join()
     return to_delete
 
