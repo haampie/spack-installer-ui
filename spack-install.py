@@ -558,6 +558,12 @@ def start_build(job_args: BuildArgs) -> ChildInfo:
     return ChildInfo(proc, job_args.package_name, output_r_conn, state_r_conn, job_args.explicit)
 
 
+def get_build_id(running_builds: Dict[int, ChildInfo], i: int) -> Optional[str]:
+    try:
+        return list(running_builds.values())[i].package_name
+    except IndexError:
+        return None
+
 def try_acquire_token(
     read_fd: int,
 ) -> bool:
@@ -677,23 +683,17 @@ Note: The -j flag is ignored when running under an existing GNU Make jobserver.
 
             if stdin_ready:
 
-                def get_build_id(i: int) -> Optional[str]:
-                    try:
-                        return list(running_builds.values())[i].package_name
-                    except IndexError:
-                        return None
-
                 try:
                     char = sys.stdin.read(1)
                 except OSError:
                     continue
                 if char == "v":
                     if build_status.overview_mode:
-                        build_status.follow_logs(get_build_id(0))
+                        build_status.follow_logs(get_build_id(running_builds, 0))
                     else:
                         build_status.toggle()
                 elif char.isdigit():
-                    build_status.follow_logs(get_build_id(int(char) - 1))
+                    build_status.follow_logs(get_build_id(running_builds, int(char) - 1))
 
             # If builds are pending, always start one if none are running yet. For parallel builds,
             # only start a new one if we can acquire a job token. These job tokens count the number
