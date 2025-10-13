@@ -642,10 +642,9 @@ Note: The -j flag is ignored when running under an existing GNU Make jobserver.
             # We wait for job tokens, signals, child output, and user input.
             events = selector.select(timeout=SPINNER_INTERVAL)
 
-            # Update the UI
-            build_status.tick()
-            build_status.redraw()
-            token_available = False
+            jobserver_token_available = False
+            children_have_finished = False
+            stdin_ready = False
 
             for key, _ in events:
                 # Child output (logs and state updates)
@@ -660,50 +659,52 @@ Note: The -j flag is ignored when running under an existing GNU Make jobserver.
                         )
                     continue
 
-                # Reap any terminated child processes
-                if key.data == "signal":
-                    try:
-                        os.read(signal_r, 1)
-                    except BlockingIOError:
-                        pass
-                    for pid in reap_children(running_builds, selector, jobserver_write_fd):
-                        build = running_builds.pop(pid)
-                        state = "finished" if build.proc.exitcode == 0 else "failed"
-                        build_status.update_state(build.package_name, state)
-
-                # Handle user input from stdin
-                elif key.data == "stdin":
-
-                    def get_build_id(i: int) -> Optional[str]:
-                        try:
-                            return list(running_builds.values())[i].package_name
-                        except IndexError:
-                            return None
-
-                    try:
-                        char = sys.stdin.read(1)
-                    except OSError:
-                        continue
-                    if char == "v":
-                        if build_status.overview_mode:
-                            build_status.follow_logs(get_build_id(0))
-                        else:
-                            build_status.toggle()
-                    elif char.isdigit():
-                        build_status.follow_logs(get_build_id(int(char) - 1))
-
-                # Start new build jobs
+                elif key.data == "signal":
+                    children_have_finished = True
                 elif key.data == "jobserver":
-                    token_available = True
+                    jobserver_token_available = True
+                elif key.data == "stdin":
+                    stdin_ready = True
 
-            if not pending_builds:
-                continue
+            if children_have_finished:
+                try:
+                    os.read(signal_r, 1)
+                except BlockingIOError:
+                    pass
+                for pid in reap_children(running_builds, selector, jobserver_write_fd):
+                    build = running_builds.pop(pid)
+                    state = "finished" if build.proc.exitcode == 0 else "failed"
+                    build_status.update_state(build.package_name, state)
+
+            if stdin_ready:
+
+                def get_build_id(i: int) -> Optional[str]:
+                    try:
+                        return list(running_builds.values())[i].package_name
+                    except IndexError:
+                        return None
+
+                try:
+                    char = sys.stdin.read(1)
+                except OSError:
+                    continue
+                if char == "v":
+                    if build_status.overview_mode:
+                        build_status.follow_logs(get_build_id(0))
+                    else:
+                        build_status.toggle()
+                elif char.isdigit():
+                    build_status.follow_logs(get_build_id(int(char) - 1))
 
             # If builds are pending, always start one if none are running yet. For parallel builds,
             # only start a new one if we can acquire a job token. These job tokens count the number
             # of *leaf nodes* in the process tree, not the total number of processes. Starting the
             # count from the second job onward ensures we don't count internal nodes.
-            if not running_builds or token_available and try_acquire_token(jobserver_read_fd):
+            if pending_builds and (
+                not running_builds
+                or jobserver_token_available
+                and try_acquire_token(jobserver_read_fd)
+            ):
                 build_args = pending_builds.pop(0)
                 child_info = start_build(build_args)
                 running_builds[child_info.proc.pid] = child_info
@@ -725,6 +726,10 @@ Note: The -j flag is ignored when running under an existing GNU Make jobserver.
                 )
                 if not pending_builds:
                     selector.unregister(jobserver_read_fd)
+
+            # Finally update the UI
+            build_status.tick()
+            build_status.redraw()
 
     finally:
         # Restore terminal settings
