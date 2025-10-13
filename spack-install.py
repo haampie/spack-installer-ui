@@ -637,9 +637,8 @@ Note: The -j flag is ignored when running under an existing GNU Make jobserver.
     selector.register(jobserver_read_fd, selectors.EVENT_READ, "jobserver")
 
     try:
-        # Event loop that manages builds and UI updates
+        # Main event loop
         while pending_builds or running_builds:
-            # We wait for job tokens, signals, child output, and user input.
             events = selector.select(timeout=SPINNER_INTERVAL)
 
             jobserver_token_available = False
