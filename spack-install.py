@@ -581,9 +581,8 @@ def get_build_id(running_builds: Dict[int, ChildInfo], i: int) -> Optional[str]:
     except IndexError:
         return None
 
-def try_acquire_token(
-    read_fd: int,
-) -> bool:
+
+def try_acquire_token(read_fd: int) -> bool:
     """Handle acquiring a job token and starting a new job if available."""
     global tokens_acquired
     try:
