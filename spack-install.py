@@ -722,16 +722,18 @@ Note: The -j flag is ignored when running under an existing GNU Make jobserver.
             ):
                 build_args = pending_builds.pop(0)
                 child_info = start_build(build_args)
-                running_builds[child_info.proc.pid] = child_info
+                pid = child_info.proc.pid
+                assert type(pid) is int
+                running_builds[pid] = child_info
                 selector.register(
                     child_info.output_r,
                     selectors.EVENT_READ,
-                    FdInfo(child_info.proc.pid, "output"),
+                    FdInfo(pid, "output"),
                 )
                 selector.register(
                     child_info.state_r,
                     selectors.EVENT_READ,
-                    FdInfo(child_info.proc.pid, "state"),
+                    FdInfo(pid, "state"),
                 )
                 build_status.add_build(
                     build_args.package_name,
