@@ -35,7 +35,7 @@ import multiprocessing
 import multiprocessing.connection
 import os
 import re
-import select
+import selectors
 import signal
 import subprocess
 import sys
@@ -73,7 +73,7 @@ class BuildArgs:
         self.should_fail = should_fail  # True if this package should fail to build
 
 
-class PackageInfo:
+class BuildInfo:
     """Information about a package being built."""
 
     def __init__(self, version: str, hash_str: str, explicit: bool) -> None:
@@ -90,17 +90,16 @@ class BuildStatus:
     """Tracks the build status display for terminal output."""
 
     def __init__(self) -> None:
-        #: Ordered dict of package name -> info
-        self.packages: Dict[str, PackageInfo] = {}
+        #: Ordered dict of build ID -> info
+        self.builds: Dict[str, BuildInfo] = {}
         self.spinner_chars = ["|", "/", "-", "\\"]
         self.spinner_index = 0
         self.dirty = True  # Start dirty to draw initial state
         self.last_lines_drawn = 0
-        self.last_spinner_update = time.time()
+        self.next_spinner_update = time.monotonic()
         self.spinner_interval = SPINNER_INTERVAL
         self.overview_mode = True  # Whether to draw the package overview
-        self.last_package: Optional[str] = None  # which package log we last tracked
-        self.tracked_logs = 0  # which process index to follow logs for (0-based)
+        self.tracked_build_id = ""  # identifier of the package whose logs we follow
         self.is_tty = sys.stdout.isatty()  # Whether stdout is a terminal
 
         # Frame dumping setup
@@ -108,37 +107,50 @@ class BuildStatus:
         self.frames_dir = "/tmp/frames"
         os.makedirs(self.frames_dir, exist_ok=True)
 
-    def add_package(
+    def add_build(
         self,
-        package: str,
+        build_id: str,
         version: str = "",
         hash_str: str = "",
         explicit: bool = False,
     ) -> None:
-        """Add a new package to the display and mark the display as dirty."""
-        if package not in self.packages:
-            self.packages[package] = PackageInfo(version, hash_str, explicit)
+        """Add a new build to the display and mark the display as dirty."""
+        if build_id not in self.builds:
+            self.builds[build_id] = BuildInfo(version, hash_str, explicit)
             self.dirty = True
 
-    def update_state(self, package: str, state: str) -> None:
+    def follow_logs(self, build_id: Optional[str]) -> None:
+        """Follow logs of a specific build by its index in the builds dict."""
+        if build_id is None:
+            return
+        self.tracked_build_id = build_id
+        if self.overview_mode:
+            self.toggle()
+        print(f"Following logs for {build_id}", flush=True)
+
+    def update_state(self, build_id: str, state: str) -> None:
         """Update the state of a package and mark the display as dirty."""
-        pkg_info = self.packages[package]
+        pkg_info = self.builds[build_id]
         pkg_info.state = state
         pkg_info.progress_percent = None
 
         if state in ("finished", "failed"):
-            pkg_info.finished_time = time.time()
+            pkg_info.finished_time = time.monotonic()
+
+            # Return to overview mode when a build finishes
+            if not self.overview_mode:
+                self.overview_mode = True
 
         self.dirty = True
 
         # For non-TTY output, print state changes immediately without colors
         if not self.is_tty:
-            print(f"{package}: {state}")
+            print(f"{build_id}: {state}")
 
     def update_progress(self, package: str, current: int, total: int) -> None:
         """Update the progress of a package and mark the display as dirty."""
         percent = int((current / total) * 100)
-        pkg_info = self.packages[package]
+        pkg_info = self.builds[package]
         if pkg_info.progress_percent != percent:
             pkg_info.progress_percent = percent
             self.dirty = True
@@ -147,24 +159,24 @@ class BuildStatus:
         """Update spinner and clean up finished packages."""
         if not self.is_tty:
             return
-        now = time.time()
+        now = time.monotonic()
 
         # Only update the spinner if there are still running packages
-        if now - self.last_spinner_update >= self.spinner_interval and any(
-            pkg.finished_time is None for pkg in self.packages.values()
+        if now >= self.next_spinner_update and any(
+            pkg.finished_time is None for pkg in self.builds.values()
         ):
             self.spinner_index = (self.spinner_index + 1) % len(self.spinner_chars)
             self.dirty = True
-            self.last_spinner_update = now
+            self.next_spinner_update = now + self.spinner_interval
 
         packages_to_remove = []
 
-        for package, pkg_info in self.packages.items():
+        for package, pkg_info in self.builds.items():
             if pkg_info.explicit or pkg_info.state == "failed" or pkg_info.finished_time is None:
                 continue
 
             if pkg_info.grayed_time is None and now - pkg_info.finished_time >= cleanup_timeout:
-                self.packages[package].grayed_time = now
+                self.builds[package].grayed_time = now
 
             # cleanup_timeout can be 0, so no elif.
             if pkg_info.grayed_time is not None and now - pkg_info.grayed_time >= cleanup_timeout:
@@ -172,7 +184,7 @@ class BuildStatus:
 
         if packages_to_remove:
             for package in packages_to_remove:
-                del self.packages[package]
+                del self.builds[package]
             self.dirty = True
 
     def toggle(self) -> None:
@@ -183,18 +195,11 @@ class BuildStatus:
         else:
             self.dirty = True
 
-    def _clear_instructions(self, lines_to_clear: int) -> List[str]:
-        """Build ANSI escape sequences for cursor movement and line clearing."""
-        parts = []
-        if lines_to_clear > 0:
-            # Move cursor up to start of display area
-            parts.append(f"\033[{lines_to_clear}A")
-            # Clear all old lines
-            for _ in range(lines_to_clear):
-                parts.append("\033[K\n")
-            # Move cursor back to start position
-            parts.append(f"\033[{lines_to_clear}A")
-        return parts
+    def logs(self, build_id: str, data: bytes) -> None:
+        if build_id != self.tracked_build_id:
+            return
+        sys.stdout.buffer.write(data)
+        sys.stdout.flush()
 
     def clear(self) -> None:
         """Clear the current display without redrawing."""
@@ -215,7 +220,7 @@ class BuildStatus:
         output_parts = self._clear_instructions(self.last_lines_drawn)
 
         # Display current active packages (if any)
-        for package, pkg_info in self.packages.items():
+        for package, pkg_info in self.builds.items():
             if pkg_info.state:
                 line = self._format_package_line(package, pkg_info)
                 output_parts.append(f"{line}\n")
@@ -226,10 +231,10 @@ class BuildStatus:
         print("".join(output_parts), end="", flush=True)
 
         # Update the number of lines drawn for the next clear cycle
-        self.last_lines_drawn = len(self.packages)
+        self.last_lines_drawn = len(self.builds)
         self.dirty = False
 
-    def _format_package_line(self, package: str, pkg_info: PackageInfo) -> str:
+    def _format_package_line(self, package: str, pkg_info: BuildInfo) -> str:
         """Format a line for a package with proper styling."""
 
         # grayed out line
@@ -265,12 +270,18 @@ class BuildStatus:
 
         return f"\033[K{indicator} {package_text}"
 
-    def logs(self, package: str, data: bytes) -> None:
-        if self.last_package != package:
-            self.last_package = package
-            print(f"\nTracking {package} logs:\n", end="")
-        sys.stdout.buffer.write(data)
-        sys.stdout.flush()
+    def _clear_instructions(self, lines_to_clear: int) -> List[str]:
+        """Build ANSI escape sequences for cursor movement and line clearing."""
+        parts = []
+        if lines_to_clear > 0:
+            # Move cursor up to start of display area
+            parts.append(f"\033[{lines_to_clear}A")
+            # Clear all old lines
+            for _ in range(lines_to_clear):
+                parts.append("\033[K\n")
+            # Move cursor back to start position
+            parts.append(f"\033[{lines_to_clear}A")
+        return parts
 
 
 class FdInfo:
@@ -349,7 +360,6 @@ def worker_function(
             raise Exception("Oh no!!")
 
         print("Installation completed successfully")
-        send_state("finished")
 
     # Explicitly close the connections when the worker is done.
     output_w_conn.close()
@@ -419,69 +429,84 @@ def setup_signal_handling() -> int:
     return signal_r
 
 
-def handle_child_output(
-    readable_fds: List[int],
-    fd_map: Dict[int, FdInfo],
+def handle_child_logs(
+    r_fd: int,
+    pid: int,
     child_data: Dict[int, ChildInfo],
     build_status: BuildStatus,
+    selector: selectors.BaseSelector,
 ) -> None:
-    """Handle reading output from child process pipes."""
-    for r_fd in readable_fds:
-        info = fd_map.get(r_fd)
-        if not info:
-            continue
+    """Handle reading output logs from a child process pipe."""
+    try:
+        # There might be more data than OUTPUT_BUFFER_SIZE, but we will read that in the next
+        # iteration of the event loop to keep things responsive.
+        data = os.read(r_fd, OUTPUT_BUFFER_SIZE)
+    except OSError:
+        data = None
+
+    if not data:  # EOF or error
         try:
-            # There might be more data than OUTPUT_BUFFER_SIZE, but we will read that in the next
-            # iteration of the event loop to keep things responsive.
-            data = os.read(r_fd, OUTPUT_BUFFER_SIZE)
-        except OSError:
-            data = None
+            selector.unregister(r_fd)
+        except KeyError:
+            pass
+        return
 
-        if not data:  # EOF or error
-            del fd_map[r_fd]
-            state_buffers.pop(r_fd, None)
+    # In overview mode, we discard logs from the child processes.
+    if build_status.overview_mode:
+        return
+
+    build_status.logs(child_data[pid].package_name, data)
+
+
+def handle_child_state(
+    r_fd: int,
+    pid: int,
+    child_data: Dict[int, ChildInfo],
+    build_status: BuildStatus,
+    selector: selectors.BaseSelector,
+) -> None:
+    """Handle reading state updates from a child process pipe."""
+    try:
+        # There might be more data than OUTPUT_BUFFER_SIZE, but we will read that in the next
+        # iteration of the event loop to keep things responsive.
+        data = os.read(r_fd, OUTPUT_BUFFER_SIZE)
+    except OSError:
+        data = None
+
+    if not data:  # EOF or error
+        try:
+            selector.unregister(r_fd)
+        except KeyError:
+            pass
+        state_buffers.pop(r_fd, None)
+        return
+
+    child_info = child_data[pid]
+
+    # Append new data to the buffer for this fd and process it
+    buffer = state_buffers.get(r_fd, "") + data.decode(errors="replace")
+    lines = buffer.split("\n")
+
+    # The last element of split() will be a partial line or an empty string.
+    # We store it back in the buffer for the next read.
+    state_buffers[r_fd] = lines.pop()
+
+    for line in lines:
+        if not line:
             continue
-
-        child_info = child_data[info.pid]
-
-        if info.name == "output":
-            # In overview mode, we discard logs from the child processes.
-            if build_status.overview_mode:
-                return
-
-            # Follow the output of the process at the specified index
-            child_pids = list(child_data.keys())
-            if child_data:
-                # Clamp the tracked_logs to the available range
-                target_pid = child_pids[min(build_status.tracked_logs, len(child_pids) - 1)]
-
-                if info.pid == target_pid:
-                    build_status.logs(child_info.package_name, data)
-        elif info.name == "state":
-            # Append new data to the buffer for this fd and process it
-            buffer = state_buffers.get(r_fd, "") + data.decode(errors="replace")
-            lines = buffer.split("\n")
-
-            # The last element of split() will be a partial line or an empty string.
-            # We store it back in the buffer for the next read.
-            state_buffers[r_fd] = lines.pop()
-
-            for line in lines:
-                if not line:
-                    continue
-                message = json.loads(line)
-                if "state" in message:
-                    build_status.update_state(child_info.package_name, message["state"])
-                elif "progress" in message and "total" in message:
-                    build_status.update_progress(
-                        child_info.package_name,
-                        message["progress"],
-                        message["total"],
-                    )
+        message = json.loads(line)
+        if "state" in message:
+            build_status.update_state(child_info.package_name, message["state"])
+        elif "progress" in message and "total" in message:
+            build_status.update_progress(
+                child_info.package_name,
+                message["progress"],
+                message["total"],
+            )
 
 
 def reap_children(
-    child_data: Dict[int, ChildInfo], fd_map: Dict[int, FdInfo], jobserver_write_fd: int
+    child_data: Dict[int, ChildInfo], selector: selectors.BaseSelector, jobserver_write_fd: int
 ) -> List[int]:
     """Reap terminated child processes"""
     global tokens_acquired
@@ -498,8 +523,14 @@ def reap_children(
             tokens_acquired -= 1
         child.output_r_conn.close()
         child.state_r_conn.close()
-        fd_map.pop(child.output_r, None)
-        fd_map.pop(child.state_r, None)
+        try:
+            selector.unregister(child.output_r)
+        except KeyError:
+            pass
+        try:
+            selector.unregister(child.state_r)
+        except KeyError:
+            pass
         child.proc.join()
     return to_delete
 
@@ -540,8 +571,11 @@ def try_acquire_token(
         return False
 
 
-def parse_args() -> argparse.Namespace:
-    """Parse command-line arguments."""
+tokens_acquired = 0
+
+
+def main() -> None:
+    """Main function implementing select-based event loop for GNU Make jobserver client."""
     parser = argparse.ArgumentParser(
         description="GNU Make jobserver client example",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -562,16 +596,8 @@ Note: The -j flag is ignored when running under an existing GNU Make jobserver.
         metavar="N",
         help="Number of parallel jobs (default: 2, ignored if running under existing jobserver)",
     )
-    return parser.parse_args()
 
-
-tokens_acquired = 0
-
-
-def main() -> None:
-    """Main function implementing select-based event loop for GNU Make jobserver client."""
-    # Parse command-line arguments
-    args = parse_args()
+    args = parser.parse_args()
 
     # Set up the jobserver FIFO
     jobserver_read_fd, jobserver_write_fd = setup_jobserver(args.jobs)
@@ -594,7 +620,6 @@ def main() -> None:
         BuildArgs("gcc", "13.2.0", "kj8hp4z", explicit=True),
     ]
     running_builds: Dict[int, ChildInfo] = {}
-    fd_map: Dict[int, FdInfo] = {}
 
     # Initialize build status display
     build_status = BuildStatus()
@@ -606,72 +631,100 @@ def main() -> None:
     old_stdin_settings = termios.tcgetattr(sys.stdin)
     tty.setcbreak(sys.stdin.fileno())
 
+    selector = selectors.DefaultSelector()
+    selector.register(signal_r, selectors.EVENT_READ, "signal")
+    selector.register(sys.stdin.fileno(), selectors.EVENT_READ, "stdin")
+    selector.register(jobserver_read_fd, selectors.EVENT_READ, "jobserver")
+
     try:
         # Event loop that manages builds and UI updates
         while pending_builds or running_builds:
             # We wait for job tokens, signals, child output, and user input.
-            read_list = [signal_r, sys.stdin.fileno(), *fd_map]
-            if pending_builds:
-                read_list.append(jobserver_read_fd)
+            events = selector.select(timeout=SPINNER_INTERVAL)
 
-            readable, _, _ = select.select(read_list, (), (), SPINNER_INTERVAL)
-
-            # 1. Update the UI
+            # Update the UI
             build_status.tick()
             build_status.redraw()
+            token_available = False
 
-            # 2. Child output (logs and state updates)
-            handle_child_output(readable, fd_map, running_builds, build_status)
-
-            # 3. Reap any terminated child processes
-            if signal_r in readable:
-                try:
-                    os.read(signal_r, 1)
-                except BlockingIOError:
-                    pass
-                for pid in reap_children(running_builds, fd_map, jobserver_write_fd):
-                    build = running_builds.pop(pid)
-                    if build.proc.exitcode != 0:
-                        build_status.update_state(build.package_name, "failed")
-
-            # 4. Handle user input from stdin
-            if sys.stdin.fileno() in readable:
-                try:
-                    key = sys.stdin.read(1)
-                except OSError:
+            for key, _ in events:
+                # Child output (logs and state updates)
+                if isinstance(key.data, FdInfo):
+                    if key.data.name == "output":
+                        handle_child_logs(
+                            key.fd, key.data.pid, running_builds, build_status, selector
+                        )
+                    elif key.data.name == "state":
+                        handle_child_state(
+                            key.fd, key.data.pid, running_builds, build_status, selector
+                        )
                     continue
-                if key == "v":
-                    # Toggle between logs and verbose mode
-                    build_status.toggle()
-                elif key.isdigit():
-                    # Follow logs of a specific process by its index
-                    process_index = int(key) - 1
-                    if process_index < 0:
-                        continue
-                    build_status.tracked_logs = process_index
-                    # Switch to verbose mode if not already
-                    if build_status.overview_mode:
-                        build_status.toggle()
 
-            # 5. Start new build jobs
+                # Reap any terminated child processes
+                if key.data == "signal":
+                    try:
+                        os.read(signal_r, 1)
+                    except BlockingIOError:
+                        pass
+                    for pid in reap_children(running_builds, selector, jobserver_write_fd):
+                        build = running_builds.pop(pid)
+                        state = "finished" if build.proc.exitcode == 0 else "failed"
+                        build_status.update_state(build.package_name, state)
+
+                # Handle user input from stdin
+                elif key.data == "stdin":
+
+                    def get_build_id(i: int) -> Optional[str]:
+                        try:
+                            return list(running_builds.values())[i].package_name
+                        except IndexError:
+                            return None
+
+                    try:
+                        char = sys.stdin.read(1)
+                    except OSError:
+                        continue
+                    if char == "v":
+                        if build_status.overview_mode:
+                            build_status.follow_logs(get_build_id(0))
+                        else:
+                            build_status.toggle()
+                    elif char.isdigit():
+                        build_status.follow_logs(get_build_id(int(char) - 1))
+
+                # Start new build jobs
+                elif key.data == "jobserver":
+                    token_available = True
+
+            if not pending_builds:
+                continue
+
             # If builds are pending, always start one if none are running yet. For parallel builds,
             # only start a new one if we can acquire a job token. These job tokens count the number
             # of *leaf nodes* in the process tree, not the total number of processes. Starting the
             # count from the second job onward ensures we don't count internal nodes.
-            if pending_builds and (not running_builds or jobserver_read_fd in readable):
-                if running_builds and not try_acquire_token(jobserver_read_fd):
-                    continue
+            if not running_builds or token_available and try_acquire_token(jobserver_read_fd):
                 build_args = pending_builds.pop(0)
                 child_info = start_build(build_args)
                 running_builds[child_info.proc.pid] = child_info
-                fd_map[child_info.output_r] = FdInfo(child_info.proc.pid, "output")
-                fd_map[child_info.state_r] = FdInfo(child_info.proc.pid, "state")
-                build_status.add_package(
+                selector.register(
+                    child_info.output_r,
+                    selectors.EVENT_READ,
+                    FdInfo(child_info.proc.pid, "output"),
+                )
+                selector.register(
+                    child_info.state_r,
+                    selectors.EVENT_READ,
+                    FdInfo(child_info.proc.pid, "state"),
+                )
+                build_status.add_build(
                     build_args.package_name,
                     build_args.version,
                     build_args.hash_str,
                     build_args.explicit,
                 )
+                if not pending_builds:
+                    selector.unregister(jobserver_read_fd)
 
     finally:
         # Restore terminal settings
@@ -684,7 +737,7 @@ def main() -> None:
         if not build_status.overview_mode:
             build_status.toggle()
         build_status.redraw()
-        os.close(jobserver_read_fd)
+        selector.close()
         os.close(jobserver_write_fd)
         old_wakeup_fd = signal.set_wakeup_fd(-1)
         os.close(old_wakeup_fd)
